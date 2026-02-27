@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Shotgun",
+  "version": "0.0.1",
+  "description": "Claude as a browser companion",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "activeTab",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "Open Shotgun"
+  }
+}
