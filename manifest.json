@@ -5,6 +5,7 @@
   "description": "Claude as a browser companion",
   "permissions": [
     "sidePanel",
+    "nativeMessaging",
     "storage",
     "activeTab",
     "tabs"
