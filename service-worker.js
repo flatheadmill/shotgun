@@ -1,6 +1,4 @@
-// Shotgun service worker — phase 005. Holds a single persistent native
-// port to Wicket. No drain gate, no stdout parsing. Wicket sends
-// normalized entries and lifecycle events.
+// Shotgun service worker — WebSocket connection to Wicket on port 6502.
 
 chrome.action.onClicked.addListener(async (tab) => {
   await chrome.sidePanel.open({ tabId: tab.id })
@@ -8,43 +6,54 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 
-const NATIVE_HOST = 'com.flatheadmill.wicket'
+let ws = null
 
-let port = null
+function forward (envelope) {
+  chrome.runtime.sendMessage({ type: 'envelope', envelope }).catch(() => {})
+}
 
-function ensurePort () {
-  if (port) return port
+function ensureConnection () {
+  if (ws && ws.readyState === WebSocket.OPEN) return
 
-  port = chrome.runtime.connectNative(NATIVE_HOST)
+  ws = new WebSocket('ws://127.0.0.1:6502')
 
-  port.onMessage.addListener((envelope) => {
-    // Forward every envelope to the sidepanel.
-    chrome.runtime.sendMessage({ type: 'envelope', envelope })
+  ws.addEventListener('open', () => {
+    ws.send(JSON.stringify({ slug: 'solver' }))
   })
 
-  port.onDisconnect.addListener(() => {
-    port = null
-    chrome.runtime.sendMessage({
-      type: 'envelope',
-      envelope: { stream: 'disconnect', data: {} }
-    })
+  ws.addEventListener('message', (event) => {
+    forward(JSON.parse(event.data))
   })
 
-  // Send the connect payload.
-  port.postMessage({ slug: 'solver' })
+  ws.addEventListener('close', () => {
+    ws = null
+    forward({ stream: 'disconnect', data: {} })
+  })
 
-  return port
+  ws.addEventListener('error', () => {
+    ws = null
+  })
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'connect') {
-    ensurePort()
+    ensureConnection()
     return
   }
 
   if (message.type === 'send') {
-    const p = ensurePort()
-    p.postMessage({ stream: 'claude', data: { message: message.text } })
+    ensureConnection()
+    const envelope = { stream: 'claude', data: { message: message.text } }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(envelope))
+    }
+    return
+  }
+
+  if (message.type === 'approve') {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ stream: 'approval', data: message.data }))
+    }
     return
   }
 })
