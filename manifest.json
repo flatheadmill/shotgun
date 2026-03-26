@@ -5,6 +5,8 @@
   "description": "Claude as a browser companion",
   "permissions": [
     "sidePanel",
+    "debugger",
+    "scripting",
     "storage",
     "activeTab",
     "tabs"
