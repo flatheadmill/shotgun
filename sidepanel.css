@@ -8,7 +8,7 @@ body {
   font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
   font-size: 14px;
   background: #1a2028;
-  color: #c8d0d8;
+  color: #c8c8c3;
   height: 100vh;
   overflow: hidden;
 }
@@ -27,7 +27,7 @@ header {
 header h1 {
   font-size: 14px;
   font-weight: 600;
-  color: #c8d0d8;
+  color: #9b9b96;
 }
 
 main {
@@ -52,7 +52,7 @@ footer {
   background: #2d3748;
   border: none;
   border-radius: 9999px;
-  color: #c8d0d8;
+  color: #c8c8c3;
   font-size: 14px;
   outline: none;
 }
@@ -62,15 +62,19 @@ footer {
 }
 
 #input:focus {
-  box-shadow: 0 0 0 2px #3a7d44;
+  box-shadow: 0 0 0 2px #46698c;
+}
+
+#input:disabled {
+  opacity: 0.5;
 }
 
 #send {
   padding: 10px 20px;
-  background: #3a7d44;
+  background: #46698c;
   border: none;
   border-radius: 9999px;
-  color: #c8d0d8;
+  color: #c8c8c3;
   font-size: 14px;
   cursor: pointer;
 }
@@ -86,12 +90,34 @@ footer {
   border-radius: 8px;
   white-space: pre-wrap;
   word-wrap: break-word;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .message.you {
-  background: #2d3748;
+  background: #1e2832;
 }
 
 .message.claude {
-  background: #1e2a35;
+  background: #1a1c20;
+}
+
+.message.thinking {
+  background: #181a1e;
+  color: #9b9b96;
+  border-left: 2px solid #46698c;
+}
+
+.message.tool {
+  background: #181a1e;
+  color: #7a8a99;
+  font-family: 'SF Mono', Menlo, monospace;
+  font-size: 12px;
+}
+
+.message.system {
+  color: #7a8a99;
+  font-size: 12px;
+  text-align: center;
+  background: none;
 }
