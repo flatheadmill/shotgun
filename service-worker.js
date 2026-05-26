@@ -149,9 +149,16 @@ function fitDimensions (w, h, params) {
 // -- Service request dispatch --
 
 function handleServiceRequest (data) {
-  if (data.type === 'capture') {
-    wsSend({ stream: 'claim', data: { id: data.id } })
-    captureScreenshot(data.id)
+  const id = data.id
+  wsSend({ stream: 'claim', data: { id } })
+
+  const type = data.type
+  if (type === 'capture') {
+    captureScreenshot(id)
+  } else if (type === 'javascript') {
+    executeJavascript(id, data.code)
+  } else {
+    sendServiceError(id, 'unknown request type: ' + data.type)
   }
 }
 
@@ -331,12 +338,155 @@ async function resizeInContentScript (tabId, base64, viewportW, viewportH, dpr, 
   return r.base64
 }
 
+// -- JavaScript execution (ported from Claude Web) --
+
+const JS_TIMEOUT = 10000
+const JS_OUTER_TIMEOUT = 15000
+const JS_MAX_OUTPUT = 51200
+
+const SENSITIVE_KEY_PATTERN = /password|token|secret|api[_-]?key|auth|credential|private[_-]?key|access[_-]?key|bearer|oauth|session/i
+
+function sanitizeOutput (value, depth = 0) {
+  if (depth > 5) return '[TRUNCATED: Max depth exceeded]'
+
+  if (typeof value === 'string') {
+    if (value.includes('=') && (value.includes(';') || value.includes('&'))) {
+      return '[BLOCKED: Cookie/query string data]'
+    }
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) {
+      return '[BLOCKED: JWT token]'
+    }
+    if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(value)) {
+      return '[BLOCKED: Base64 encoded data]'
+    }
+    if (/^[a-f0-9]{32,}$/i.test(value)) {
+      return '[BLOCKED: Hex credential]'
+    }
+    if (value.length > 1000) return value.substring(0, 1000) + '[TRUNCATED]'
+  }
+
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const result = {}
+    for (const [key, val] of Object.entries(value)) {
+      if (SENSITIVE_KEY_PATTERN.test(key)) {
+        result[key] = '[BLOCKED: Sensitive key]'
+      } else if (key === 'cookie' || key === 'cookies') {
+        result[key] = '[BLOCKED: Cookie access]'
+      } else {
+        result[key] = sanitizeOutput(val, depth + 1)
+      }
+    }
+    return result
+  }
+
+  if (Array.isArray(value)) {
+    const result = value.slice(0, 100).map(item => sanitizeOutput(item, depth + 1))
+    if (value.length > 100) {
+      result.push(`[TRUNCATED: ${value.length - 100} more items]`)
+    }
+    return result
+  }
+
+  return value
+}
+
+function formatResult (cdpResult) {
+  if (cdpResult.exceptionDetails) {
+    const ex = cdpResult.exceptionDetails.exception
+    const isTimeout = ex?.description?.includes('execution was terminated')
+    const message = isTimeout
+      ? `Execution timeout: Code exceeded ${JS_TIMEOUT / 1000}-second limit`
+      : ex?.description || ex?.value || 'Unknown error'
+    return { error: `JavaScript execution error: ${message}` }
+  }
+
+  if (!cdpResult.result) return { output: 'undefined' }
+
+  const r = cdpResult.result
+  let output = ''
+
+  if (r.type === 'undefined') {
+    output = 'undefined'
+  } else if (r.type === 'object' && r.subtype === 'null') {
+    output = 'null'
+  } else if (r.type === 'function') {
+    output = r.description || '[Function]'
+  } else if (r.type === 'object') {
+    if (r.subtype === 'node') {
+      output = r.description || '[DOM Node]'
+    } else if (r.subtype === 'array') {
+      output = r.description || '[Array]'
+    } else {
+      const sanitized = sanitizeOutput(r.value || {})
+      output = r.description || JSON.stringify(sanitized, null, 2)
+    }
+  } else if (r.value !== undefined) {
+    const sanitized = sanitizeOutput(r.value)
+    output = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized, null, 2)
+  } else {
+    output = r.description || String(r.value)
+  }
+
+  if (output.length > JS_MAX_OUTPUT) {
+    output = output.substring(0, JS_MAX_OUTPUT) + '\n[OUTPUT TRUNCATED: Exceeded 50KB limit]'
+  }
+
+  return { output }
+}
+
+async function executeJavascript (requestId, code) {
+  try {
+    if (!code) {
+      sendServiceResult(requestId, { error: 'Code parameter is required' })
+      return
+    }
+
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (!tab) {
+      sendServiceResult(requestId, { error: 'No active tab found' })
+      return
+    }
+
+    const tabId = tab.id
+    await ensureDebugger(tabId)
+
+    const expression = `
+      (function() {
+        'use strict';
+        try {
+          return eval(${JSON.stringify(code)});
+        } catch (e) {
+          throw e;
+        }
+      })()`
+
+    const result = await chrome.debugger.sendCommand(
+      { tabId },
+      'Runtime.evaluate',
+      { expression, returnByValue: true, awaitPromise: true, timeout: JS_TIMEOUT }
+    )
+
+    sendServiceResult(requestId, formatResult(result))
+  } catch (e) {
+    sendServiceResult(requestId, {
+      error: `Failed to execute JavaScript: ${e.message || 'Unknown error'}`
+    })
+  }
+}
+
 // -- Service response helpers --
 
 function sendServiceResponse (requestId, contentType, base64Body) {
   wsSend({
     stream: 'response',
     data: { id: requestId, content_type: contentType, body: base64Body }
+  })
+}
+
+function sendServiceResult (requestId, result) {
+  wsSend({
+    stream: 'response',
+    data: { id: requestId, content_type: 'application/json', body: btoa(JSON.stringify(result)) }
   })
 }
 
