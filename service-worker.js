@@ -1,8 +1,9 @@
-// Shotgun service worker — WebSocket connection to Wicket on port 6502.
+// Shotgun service worker — WebSocket connection to Easement on port 6502.
 //
-// Ported from Claude Web (mcpPermissions-CUBzZeeG.js, 1.0.72).
+// Tab group management ported from Claude Web (mcpPermissions-CUBzZeeG.js, 1.0.72).
 
-const SLUG = 'chrome'
+const GROUP_COLOR = 'yellow'
+const STORAGE_KEY_PREFIX = 'shotgun_tab_group_'
 
 // -- Screenshot constants from Claude Web --
 
@@ -17,6 +18,94 @@ const MIN_JPEG_QUALITY = 0.10
 const attachedTabs = new Set()
 const screenshotContexts = new Map()
 
+// -- Tab group management (per slug) --
+
+const tabGroups = {}
+
+async function loadTabGroupForSlug (slug) {
+  if (!slug) return null
+  if (tabGroups[slug]) return tabGroups[slug]
+  const key = STORAGE_KEY_PREFIX + slug
+  const data = await chrome.storage.local.get(key)
+  const id = data[key]
+  if (id == null) return null
+  try {
+    await chrome.tabGroups.get(id)
+    tabGroups[slug] = id
+    return id
+  } catch {
+    await chrome.storage.local.remove(key)
+    return null
+  }
+}
+
+async function saveTabGroupForSlug (slug, groupId) {
+  tabGroups[slug] = groupId
+  const key = STORAGE_KEY_PREFIX + slug
+  await chrome.storage.local.set({ [key]: groupId })
+}
+
+async function ensureGroupCharacteristics (slug, groupId) {
+  try {
+    const group = await chrome.tabGroups.get(groupId)
+    if (group.title !== slug || group.color !== GROUP_COLOR) {
+      await chrome.tabGroups.update(groupId, { title: slug, color: GROUP_COLOR })
+    }
+  } catch (e) {}
+}
+
+async function getTabContext (slug) {
+  const groupId = await loadTabGroupForSlug(slug)
+  if (!groupId) {
+    return { currentTabId: null, availableTabs: [], tabCount: 0, tabGroupId: null }
+  }
+  try {
+    await chrome.tabGroups.get(groupId)
+    await ensureGroupCharacteristics(slug, groupId)
+  } catch {
+    delete tabGroups[slug]
+    const key = STORAGE_KEY_PREFIX + slug
+    await chrome.storage.local.remove(key)
+    return { currentTabId: null, availableTabs: [], tabCount: 0, tabGroupId: null }
+  }
+  const tabs = (await chrome.tabs.query({ groupId }))
+    .filter(t => t.id !== undefined)
+    .map(t => ({ id: t.id, title: t.title || '', url: t.url || '' }))
+  return {
+    currentTabId: tabs.length > 0 ? tabs[0].id : null,
+    availableTabs: tabs,
+    tabCount: tabs.length,
+    tabGroupId: groupId
+  }
+}
+
+async function createTabInGroup (slug, url) {
+  const tab = await chrome.tabs.create({ url: url || 'chrome://newtab', active: true })
+  if (!tab.id) return { error: 'Failed to create tab.' }
+  let groupId = await loadTabGroupForSlug(slug)
+  if (!groupId) {
+    groupId = await chrome.tabs.group({ tabIds: [tab.id] })
+    await chrome.tabGroups.update(groupId, { title: slug, color: GROUP_COLOR, collapsed: false })
+    await saveTabGroupForSlug(slug, groupId)
+  } else {
+    await chrome.tabs.group({ tabIds: tab.id, groupId })
+  }
+  const context = await getTabContext(slug)
+  return {
+    output: `Created tab ${tab.id}${url ? ' at ' + url : ''}`,
+    tabContext: context
+  }
+}
+
+async function navigateTab (tabId, url) {
+  try {
+    await chrome.tabs.update(tabId, { url })
+    return { output: `Navigated tab ${tabId} to ${url}` }
+  } catch (e) {
+    return { error: `Failed to navigate: ${e.message}` }
+  }
+}
+
 // -- Side panel and action --
 
 chrome.action.onClicked.addListener(async (tab) => {
@@ -25,7 +114,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 
-// -- WebSocket connection to Wicket --
+// -- WebSocket connection to Easement --
 
 let ws = null
 let heartbeatInterval = null
@@ -47,7 +136,6 @@ function ensureConnection () {
   ws = new WebSocket('ws://127.0.0.1:6502')
 
   ws.addEventListener('open', () => {
-    wsSend({ slug: SLUG, protocol: 'wicket' })
     if (heartbeatInterval) clearInterval(heartbeatInterval)
     heartbeatInterval = setInterval(() => {
       wsSend({ stream: 'heartbeat', data: {} })
@@ -59,7 +147,7 @@ function ensureConnection () {
     try {
       const envelope = JSON.parse(event.data)
       if (envelope.stream === 'request') {
-        handleServiceRequest(envelope.data)
+        handleServiceRequest(envelope.data, envelope.slug, envelope.timestamp)
       } else {
         forward(envelope)
       }
@@ -148,35 +236,87 @@ function fitDimensions (w, h, params) {
 
 // -- Service request dispatch --
 
-function handleServiceRequest (data) {
-  const id = data.id
-  wsSend({ stream: 'claim', data: { id } })
+let currentRequestSlug = null
+let currentRequestTimestamp = null
 
+function handleServiceRequest (data, slug, ts) {
+  const id = data.id
   const type = data.type
+  currentRequestSlug = slug || null
+  currentRequestTimestamp = ts || null
+
   if (type === 'capture') {
-    captureScreenshot(id)
+    captureScreenshot(id, data.tabId)
   } else if (type === 'javascript') {
-    executeJavascript(id, data.code)
+    executeJavascript(id, data.code, data.tabId)
+  } else if (type === 'tabs_context') {
+    handleTabsContext(id, currentRequestSlug)
+  } else if (type === 'tabs_create') {
+    handleTabsCreate(id, currentRequestSlug, data.url)
+  } else if (type === 'navigate') {
+    handleNavigate(id, data.tabId, data.url)
   } else {
-    sendServiceError(id, 'unknown request type: ' + data.type)
+    sendServiceError(id, 'unknown request type: ' + type)
+  }
+}
+
+// -- Tab tools --
+
+async function handleTabsContext (requestId, slug) {
+  try {
+    const context = await getTabContext(slug)
+    sendServiceResult(requestId, { output: JSON.stringify(context, null, 2), tabContext: context })
+  } catch (e) {
+    sendServiceResult(requestId, { error: e.message || 'tabs_context failed' })
+  }
+}
+
+async function handleTabsCreate (requestId, slug, url) {
+  try {
+    const result = await createTabInGroup(slug, url)
+    sendServiceResult(requestId, result)
+  } catch (e) {
+    sendServiceResult(requestId, { error: e.message || 'tabs_create failed' })
+  }
+}
+
+async function handleNavigate (requestId, tabId, url) {
+  if (!tabId || !url) {
+    sendServiceResult(requestId, { error: 'tabId and url are required' })
+    return
+  }
+  try {
+    const result = await navigateTab(tabId, url)
+    sendServiceResult(requestId, result)
+  } catch (e) {
+    sendServiceResult(requestId, { error: e.message || 'navigate failed' })
   }
 }
 
 // -- Screenshot capture (ported from Claude Web) --
 
-async function captureScreenshot (requestId) {
+async function resolveTabId (tabId) {
+  if (tabId) return tabId
+  if (currentRequestSlug) {
+    const context = await getTabContext(currentRequestSlug)
+    if (context && context.currentTabId) return context.currentTabId
+  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+  return tab ? tab.id : null
+}
+
+async function captureScreenshot (requestId, tabId) {
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-    if (!tab) {
-      sendServiceError(requestId, 'no active tab')
+    const resolvedTabId = await resolveTabId(tabId)
+    if (!resolvedTabId) {
+      sendServiceError(requestId, 'no tab to capture')
       return
     }
 
-    const tabId = tab.id
-    await ensureDebugger(tabId)
+    await ensureDebugger(resolvedTabId)
 
     const [probeResult] = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId: resolvedTabId },
       injectImmediately: true,
       func: () => ({
         width: window.innerWidth,
@@ -207,7 +347,7 @@ async function captureScreenshot (requestId) {
       clip: { x: scrollX, y: scrollY, width, height, scale }
     }
 
-    const result = await chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', cdpParams)
+    const result = await chrome.debugger.sendCommand({ tabId: resolvedTabId }, 'Page.captureScreenshot', cdpParams)
     if (!result || !result.data) {
       sendServiceError(requestId, 'CDP capture returned no data')
       return
@@ -216,10 +356,10 @@ async function captureScreenshot (requestId) {
     let base64 = result.data
 
     if (base64.length > MAX_BASE64_CHARS) {
-      base64 = await resizeInContentScript(tabId, base64, width, height, dpr, scale)
+      base64 = await resizeInContentScript(resolvedTabId, base64, width, height, dpr, scale)
     }
 
-    screenshotContexts.set(tabId, {
+    screenshotContexts.set(resolvedTabId, {
       viewportWidth: width,
       viewportHeight: height,
       screenshotWidth: targetW,
@@ -341,7 +481,6 @@ async function resizeInContentScript (tabId, base64, viewportW, viewportH, dpr, 
 // -- JavaScript execution (ported from Claude Web) --
 
 const JS_TIMEOUT = 10000
-const JS_OUTER_TIMEOUT = 15000
 const JS_MAX_OUTPUT = 51200
 
 const SENSITIVE_KEY_PATTERN = /password|token|secret|api[_-]?key|auth|credential|private[_-]?key|access[_-]?key|bearer|oauth|session/i
@@ -434,21 +573,20 @@ function formatResult (cdpResult) {
   return { output }
 }
 
-async function executeJavascript (requestId, code) {
+async function executeJavascript (requestId, code, tabId) {
   try {
     if (!code) {
       sendServiceResult(requestId, { error: 'Code parameter is required' })
       return
     }
 
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-    if (!tab) {
-      sendServiceResult(requestId, { error: 'No active tab found' })
+    const resolvedTabId = await resolveTabId(tabId)
+    if (!resolvedTabId) {
+      sendServiceResult(requestId, { error: 'No tab found' })
       return
     }
 
-    const tabId = tab.id
-    await ensureDebugger(tabId)
+    await ensureDebugger(resolvedTabId)
 
     const expression = `
       (function() {
@@ -460,13 +598,16 @@ async function executeJavascript (requestId, code) {
         }
       })()`
 
-    const result = await chrome.debugger.sendCommand(
-      { tabId },
+    chrome.debugger.sendCommand(
+      { tabId: resolvedTabId },
       'Runtime.evaluate',
       { expression, returnByValue: true, awaitPromise: true, timeout: JS_TIMEOUT }
+    ).then(
+      result => sendServiceResult(requestId, formatResult(result)),
+      err => sendServiceResult(requestId, {
+        error: `Failed to execute JavaScript: ${err.message || 'Unknown error'}`
+      })
     )
-
-    sendServiceResult(requestId, formatResult(result))
   } catch (e) {
     sendServiceResult(requestId, {
       error: `Failed to execute JavaScript: ${e.message || 'Unknown error'}`
@@ -479,20 +620,32 @@ async function executeJavascript (requestId, code) {
 function sendServiceResponse (requestId, contentType, base64Body) {
   wsSend({
     stream: 'response',
-    data: { id: requestId, content_type: contentType, body: base64Body }
+    slug: currentRequestSlug,
+    timestamp: currentRequestTimestamp,
+    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: contentType, body: base64Body }
   })
 }
 
 function sendServiceResult (requestId, result) {
   wsSend({
     stream: 'response',
-    data: { id: requestId, content_type: 'application/json', body: btoa(JSON.stringify(result)) }
+    slug: currentRequestSlug,
+    timestamp: currentRequestTimestamp,
+    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'application/json', body: btoa(JSON.stringify(result)) }
   })
 }
+
+// -- Connect on startup --
+
+ensureConnection()
+
+// -- Service response helpers --
 
 function sendServiceError (requestId, message) {
   wsSend({
     stream: 'response',
-    data: { id: requestId, content_type: 'text/plain', body: btoa(message) }
+    slug: currentRequestSlug,
+    timestamp: currentRequestTimestamp,
+    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'text/plain', body: btoa(message) }
   })
 }
