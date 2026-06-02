@@ -146,8 +146,10 @@ function ensureConnection () {
   ws.addEventListener('message', (event) => {
     try {
       const envelope = JSON.parse(event.data)
-      if (envelope.stream === 'request') {
-        handleServiceRequest(envelope.data, envelope.slug, envelope.timestamp)
+      if (envelope.stream === 'call') {
+        handleCall(envelope.data, envelope.slug, envelope.timestamp)
+      } else if (envelope.stream === 'tools_query') {
+        handleToolsQuery(envelope.data)
       } else {
         forward(envelope)
       }
@@ -239,25 +241,53 @@ function fitDimensions (w, h, params) {
 let currentRequestSlug = null
 let currentRequestTimestamp = null
 
-function handleServiceRequest (data, slug, ts) {
-  const id = data.id
-  const type = data.type
+function handleCall (data, slug, ts) {
+  const who = data.who || ''
+  const f = data.f || ''
+  const id = data.id || ''
+  const args = data.args || {}
+
+  if (who !== 'shotgun') return
+
   currentRequestSlug = slug || null
   currentRequestTimestamp = ts || null
 
-  if (type === 'capture') {
-    captureScreenshot(id, data.tabId)
-  } else if (type === 'javascript') {
-    executeJavascript(id, data.code, data.tabId)
-  } else if (type === 'tabs_context') {
-    handleTabsContext(id, currentRequestSlug)
-  } else if (type === 'tabs_create') {
-    handleTabsCreate(id, currentRequestSlug, data.url)
-  } else if (type === 'navigate') {
-    handleNavigate(id, data.tabId, data.url)
-  } else {
-    sendServiceError(id, 'unknown request type: ' + type)
+  switch (f) {
+    case 'screenshot':
+      captureScreenshot(id, args.tabId)
+      break
+    case 'javascript':
+      executeJavascript(id, args.code, args.tabId)
+      break
+    case 'tabs_context':
+      handleTabsContext(id, currentRequestSlug)
+      break
+    case 'tabs_create':
+      handleTabsCreate(id, currentRequestSlug, args.url)
+      break
+    case 'navigate':
+      handleNavigate(id, args.tabId, args.url)
+      break
+    default:
+      sendServiceError(id, 'unknown function: ' + f)
   }
+}
+
+function handleToolsQuery (data) {
+  const queryId = data.id || ''
+  wsSend({
+    stream: 'tools_response',
+    data: {
+      id: queryId,
+      tools: [
+        { who: 'shotgun', f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
+        { who: 'shotgun', f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
+        { who: 'shotgun', f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
+        { who: 'shotgun', f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
+        { who: 'shotgun', f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' }
+      ]
+    }
+  })
 }
 
 // -- Tab tools --
@@ -638,6 +668,9 @@ function sendServiceResult (requestId, result) {
 // -- Connect on startup --
 
 ensureConnection()
+
+chrome.alarms.create('keepalive', { periodInMinutes: 0.25 })
+chrome.alarms.onAlarm.addListener(() => ensureConnection())
 
 // -- Service response helpers --
 
