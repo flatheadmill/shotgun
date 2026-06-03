@@ -1,7 +1,12 @@
 // Shotgun service worker — WebSocket connection to Easement on port 6502.
 //
-// Tab group management.
-
+// Global client — no slug association. Receives all messages on the broadcast
+// bus and filters for call envelopes where who === 'shotgun'. Tool requests
+// arrive tagged with slug and timestamp for routing the response back.
+//
+// Five tools: screenshot, javascript, tabs_context, tabs_create, navigate.
+// Tab groups are per-slug, persisted in chrome.storage.local.
+//
 const GROUP_COLOR = 'yellow'
 const STORAGE_KEY_PREFIX = 'shotgun_tab_group_'
 
@@ -18,7 +23,21 @@ const MIN_JPEG_QUALITY = 0.10
 const attachedTabs = new Set()
 const screenshotContexts = new Map()
 
+function utf8ToBase64 (str) {
+  // btoa chokes on non-Latin1. Page content has unicode.
+  const bytes = new TextEncoder().encode(str)
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary)
+}
+
 // -- Tab group management (per slug) --
+//
+// Tab groups survive across context windows — they belong to the collaboration
+// (slug), not the session (timestamp). Chrome deletes the group when the last
+// tab in it closes. We persist the group ID in chrome.storage.local and
+// validate it on each use because Chrome may have cleaned it up behind our
+// back.
 
 const tabGroups = {}
 
@@ -115,6 +134,11 @@ chrome.action.onClicked.addListener(async (tab) => {
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 
 // -- WebSocket connection to Easement --
+//
+// No connect payload, no slug. Shotgun is a global client. The heartbeat keeps
+// the service worker alive under Manifest V3. The chrome.alarms keepalive at
+// the bottom of the file restarts the connection if the worker dies between
+// heartbeats.
 
 let ws = null
 let heartbeatInterval = null
@@ -190,6 +214,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 })
 
 // -- Debugger lifecycle --
+//
+// Attach once per tab, stay attached. Chrome detaches automatically when the
+// tab closes or navigates to a chrome:// URL. The yellow "is being debugged"
+// bar is the cost of CDP access.
 
 async function ensureDebugger (tabId) {
   if (attachedTabs.has(tabId)) return
@@ -207,6 +235,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 })
 
 // -- Token budget resize --
+//
+// Estimate image tokens from dimensions and resize toward configured limits. fitDimensions binary-searches for the largest size
+// that stays under the token cap. If the CDP capture is still too large after
+// scaling, resizeInContentScript does JPEG quality stepping in a canvas
+// element on the page.
 
 function tokensForDimensions (w, h, pxPerToken) {
   return Math.ceil(w / pxPerToken) * Math.ceil(h / pxPerToken)
@@ -237,6 +270,11 @@ function fitDimensions (w, h, params) {
 }
 
 // -- Service request dispatch --
+//
+// currentRequestSlug/Timestamp are stashed per-call so the response helpers
+// can include them. Easement needs slug and timestamp to route the response
+// back to the correct coordinator. Without them, the response has nowhere to
+// go.
 
 let currentRequestSlug = null
 let currentRequestTimestamp = null
@@ -509,6 +547,13 @@ async function resizeInContentScript (tabId, base64, viewportW, viewportH, dpr, 
 }
 
 // -- JavaScript execution --
+//
+// Runtime.evaluate in the page world via CDP. The sanitizer strips
+// credentials, tokens, cookies, and long strings from the return value before
+// it travels back through the WebSocket.
+//
+  // The CDP call uses .then() instead of await so the service worker stays
+// responsive while synchronous JS (alert, confirm) freezes the renderer.
 
 const JS_TIMEOUT = 10000
 const JS_MAX_OUTPUT = 51200
@@ -621,6 +666,7 @@ async function executeJavascript (requestId, code, tabId) {
     const expression = `
       (function() {
         'use strict';
+        // This code throws and we know it.
         try {
           return eval(${JSON.stringify(code)});
         } catch (e) {
@@ -645,7 +691,13 @@ async function executeJavascript (requestId, code, tabId) {
   }
 }
 
-// -- Service response helpers --
+// -- Response helpers --
+//
+// Three flavors: binary (screenshots), JSON (tool results), and plain text
+// (errors). All carry slug and timestamp for routing. sendServiceResponse
+// passes base64 through as-is (already encoded by CDP). sendServiceResult and
+// sendServiceError encode via utf8ToBase64 because the content may have
+// unicode.
 
 function sendServiceResponse (requestId, contentType, base64Body) {
   wsSend({
@@ -661,24 +713,26 @@ function sendServiceResult (requestId, result) {
     stream: 'response',
     slug: currentRequestSlug,
     timestamp: currentRequestTimestamp,
-    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'application/json', body: btoa(JSON.stringify(result)) }
+    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'application/json', body: utf8ToBase64(JSON.stringify(result)) }
   })
 }
-
-// -- Connect on startup --
-
-ensureConnection()
-
-chrome.alarms.create('keepalive', { periodInMinutes: 0.25 })
-chrome.alarms.onAlarm.addListener(() => ensureConnection())
-
-// -- Service response helpers --
 
 function sendServiceError (requestId, message) {
   wsSend({
     stream: 'response',
     slug: currentRequestSlug,
     timestamp: currentRequestTimestamp,
-    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'text/plain', body: btoa(message) }
+    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'text/plain', body: utf8ToBase64(message) }
   })
 }
+
+// -- Connect on startup --
+//
+// Manifest V3 kills service workers after 30s idle. The alarm wakes us even
+// after Chrome terminates the worker. 15 seconds is frequent enough that tool
+// calls rarely hit a dead worker.
+
+ensureConnection()
+
+chrome.alarms.create('keepalive', { periodInMinutes: 0.25 })
+chrome.alarms.onAlarm.addListener(() => ensureConnection())

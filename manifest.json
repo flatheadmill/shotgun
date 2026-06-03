@@ -10,7 +10,8 @@
     "storage",
     "activeTab",
     "tabs",
-    "tabGroups"
+    "tabGroups",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"
