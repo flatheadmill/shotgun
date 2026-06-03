@@ -7,8 +7,11 @@
 // Five tools: screenshot, javascript, tabs_context, tabs_create, navigate.
 // Tab groups are per-slug, persisted in chrome.storage.local.
 //
-// Screenshot pipeline and sanitizer ported from Claude Web 1.0.72
+// Screenshot pipeline ported from Claude Web 1.0.72
 // (mcpPermissions-CUBzZeeG.js). Reference at ~/code/reference/claude-web/.
+// Claude Web's output sanitizer was removed — it blocked page content
+// that looked like credentials. We own the pipe. The operator sees
+// the transcript.
 
 const GROUP_COLOR = 'yellow'
 const STORAGE_KEY_PREFIX = 'shotgun_tab_group_'
@@ -563,52 +566,6 @@ async function resizeInContentScript (tabId, base64, viewportW, viewportH, dpr, 
 const JS_TIMEOUT = 10000
 const JS_MAX_OUTPUT = 51200
 
-const SENSITIVE_KEY_PATTERN = /password|token|secret|api[_-]?key|auth|credential|private[_-]?key|access[_-]?key|bearer|oauth|session/i
-
-function sanitizeOutput (value, depth = 0) {
-  if (depth > 5) return '[TRUNCATED: Max depth exceeded]'
-
-  if (typeof value === 'string') {
-    if (value.includes('=') && (value.includes(';') || value.includes('&'))) {
-      return '[BLOCKED: Cookie/query string data]'
-    }
-    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) {
-      return '[BLOCKED: JWT token]'
-    }
-    if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(value)) {
-      return '[BLOCKED: Base64 encoded data]'
-    }
-    if (/^[a-f0-9]{32,}$/i.test(value)) {
-      return '[BLOCKED: Hex credential]'
-    }
-    if (value.length > 1000) return value.substring(0, 1000) + '[TRUNCATED]'
-  }
-
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const result = {}
-    for (const [key, val] of Object.entries(value)) {
-      if (SENSITIVE_KEY_PATTERN.test(key)) {
-        result[key] = '[BLOCKED: Sensitive key]'
-      } else if (key === 'cookie' || key === 'cookies') {
-        result[key] = '[BLOCKED: Cookie access]'
-      } else {
-        result[key] = sanitizeOutput(val, depth + 1)
-      }
-    }
-    return result
-  }
-
-  if (Array.isArray(value)) {
-    const result = value.slice(0, 100).map(item => sanitizeOutput(item, depth + 1))
-    if (value.length > 100) {
-      result.push(`[TRUNCATED: ${value.length - 100} more items]`)
-    }
-    return result
-  }
-
-  return value
-}
-
 function formatResult (cdpResult) {
   if (cdpResult.exceptionDetails) {
     const ex = cdpResult.exceptionDetails.exception
@@ -636,12 +593,10 @@ function formatResult (cdpResult) {
     } else if (r.subtype === 'array') {
       output = r.description || '[Array]'
     } else {
-      const sanitized = sanitizeOutput(r.value || {})
-      output = r.description || JSON.stringify(sanitized, null, 2)
+      output = r.description || JSON.stringify(r.value || {}, null, 2)
     }
   } else if (r.value !== undefined) {
-    const sanitized = sanitizeOutput(r.value)
-    output = typeof sanitized === 'string' ? sanitized : JSON.stringify(sanitized, null, 2)
+    output = typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 2)
   } else {
     output = r.description || String(r.value)
   }
