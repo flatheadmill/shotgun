@@ -313,6 +313,9 @@ function handleCall (data, slug, ts) {
     case 'navigate':
       handleNavigate(id, args.tabId, args.url)
       break
+    case 'read_page':
+      handleReadPage(id, args.selector, args.maxChars, args.tabId, args.frameId)
+      break
     default:
       sendServiceError(id, 'unknown function: ' + f)
   }
@@ -329,7 +332,8 @@ function handleToolsQuery (data) {
         { who: 'shotgun', f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
         { who: 'shotgun', f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
         { who: 'shotgun', f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
-        { who: 'shotgun', f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' }
+        { who: 'shotgun', f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
+        { who: 'shotgun', f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional).' }
       ]
     }
   })
@@ -365,6 +369,36 @@ async function handleNavigate (requestId, tabId, url) {
     sendServiceResult(requestId, result)
   } catch (e) {
     sendServiceResult(requestId, { error: e.message || 'navigate failed' })
+  }
+}
+
+// -- Page reading (isolated world content script) --
+//
+// Reads the DOM through the content script, not through Runtime.evaluate.
+// The page cannot see this. No CDP, no debugger, no page-world execution.
+
+async function handleReadPage (requestId, selector, maxChars, tabId, frameId) {
+  try {
+    const resolvedTabId = await resolveTabId(tabId)
+    if (!resolvedTabId) {
+      sendServiceResult(requestId, { error: 'No tab found' })
+      return
+    }
+    // frameId 0 = top frame. Content script is in all frames but we
+    // default to top. Pass frameId in args to read a specific iframe.
+    const targetFrame = frameId != null ? frameId : 0
+    const response = await chrome.tabs.sendMessage(resolvedTabId, {
+      type: 'read_page',
+      selector: selector || null,
+      maxChars: maxChars || 50000
+    }, { frameId: targetFrame })
+    if (response.error) {
+      sendServiceResult(requestId, { error: response.error })
+    } else {
+      sendServiceResult(requestId, { output: response.text, title: response.title, url: response.url, selector: response.selector, length: response.length })
+    }
+  } catch (e) {
+    sendServiceResult(requestId, { error: e.message || 'read_page failed' })
   }
 }
 
