@@ -1,11 +1,11 @@
 // Shotgun service worker — WebSocket connection to Easement on port 6502.
 //
-// Global client — no slug association. Receives all messages on the broadcast
-// bus and filters for call envelopes where who === 'shotgun'. Tool requests
-// arrive tagged with slug and timestamp for routing the response back.
+// Registers as who=shotgun, where=localhost. Tools are declared at connect
+// time. Easement dispatches tool calls directly to our socket — no
+// broadcast, no claims.
 //
-// Five tools: screenshot, javascript, tabs_context, tabs_create, navigate.
-// Tab groups are per-slug, persisted in chrome.storage.local.
+// Six tools: screenshot, javascript, tabs_context, tabs_create, navigate,
+// read_page. Tab groups are per-slug, persisted in chrome.storage.local.
 //
 // Screenshot pipeline ported from Claude Web 1.0.72
 // (mcpPermissions-CUBzZeeG.js). Reference at ~/code/reference/claude-web/.
@@ -141,16 +141,25 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 
 // -- WebSocket connection to Easement --
 //
-// No connect payload, no slug. Shotgun is a global client. The heartbeat keeps
-// the service worker alive under Manifest V3. The chrome.alarms keepalive at
-// the bottom of the file restarts the connection if the worker dies between
-// heartbeats.
+// On open, register with who=shotgun, where=browser, and declare our tools.
+// Easement dispatches calls directly to our socket. The heartbeat keeps the
+// service worker alive. The chrome.alarms keepalive restarts the connection
+// if the worker dies.
 
 let ws = null
 let heartbeatInterval = null
 
-function forward (envelope) {
-  chrome.runtime.sendMessage({ type: 'envelope', envelope }).catch(() => {})
+const TOOLS = [
+  { f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
+  { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
+  { f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
+  { f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
+  { f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
+  { f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional), frameId (int, optional, default 0 for top frame).' },
+]
+
+function forward (msg) {
+  chrome.runtime.sendMessage({ type: 'envelope', envelope: msg }).catch(() => {})
 }
 
 function wsSend (obj) {
@@ -166,6 +175,9 @@ function ensureConnection () {
   ws = new WebSocket('ws://127.0.0.1:6502')
 
   ws.addEventListener('open', () => {
+    // Register with Easement. Tools declared here, not via tools_query.
+    wsSend({ what: 'socket', why: 'connect', who: 'shotgun', where: 'localhost', tools: TOOLS })
+
     if (heartbeatInterval) clearInterval(heartbeatInterval)
     heartbeatInterval = setInterval(() => {
       wsSend({ stream: 'heartbeat', data: {} })
@@ -175,14 +187,16 @@ function ensureConnection () {
 
   ws.addEventListener('message', (event) => {
     try {
-      const envelope = JSON.parse(event.data)
-      if (envelope.stream === 'call') {
-        handleCall(envelope.data, envelope.slug, envelope.timestamp)
-      } else if (envelope.stream === 'tools_query') {
-        handleToolsQuery(envelope.data)
-      } else {
-        forward(envelope)
+      const msg = JSON.parse(event.data)
+
+      // Tool dispatch from Easement. Tagged with what=tool, why=run.
+      if (msg.what === 'tool' && msg.why === 'run') {
+        handleToolRun(msg)
+        return
       }
+
+      // Everything else forwards to the side panel.
+      forward(msg)
     } catch (e) {}
   })
 
@@ -276,99 +290,85 @@ function fitDimensions (w, h, params) {
   return [lo, Math.max(Math.round(lo / aspect), 1)]
 }
 
-// -- Service request dispatch --
+// -- Tool dispatch --
 //
-// currentRequestSlug/Timestamp are stashed per-call so the response helpers
-// can include them. Easement needs slug and timestamp to route the response
-// back to the correct coordinator. Without them, the response has nowhere to
-// go.
+// Easement sends { what: "tool", why: "run", slug, transcript, call_id, f, ...args }.
+// We dispatch by f, do the work, send { what: "tool", why: "response", call_id, output, exit_code }.
 
-let currentRequestSlug = null
-let currentRequestTimestamp = null
+let currentSlug = null
 
-function handleCall (data, slug, ts) {
-  const who = data.who || ''
-  const f = data.f || ''
-  const id = data.id || ''
-  const args = data.args || {}
-
-  if (who !== 'shotgun') return
-
-  currentRequestSlug = slug || null
-  currentRequestTimestamp = ts || null
+function handleToolRun (msg) {
+  const callId = msg.call_id || ''
+  const f = msg.f || ''
+  currentSlug = msg.slug || null
 
   switch (f) {
     case 'screenshot':
-      captureScreenshot(id, args.tabId)
+      captureScreenshot(callId, msg.tabId)
       break
     case 'javascript':
-      executeJavascript(id, args.code, args.tabId)
+      executeJavascript(callId, msg.code, msg.tabId)
       break
     case 'tabs_context':
-      handleTabsContext(id, currentRequestSlug)
+      handleTabsContext(callId, currentSlug)
       break
     case 'tabs_create':
-      handleTabsCreate(id, currentRequestSlug, args.url)
+      handleTabsCreate(callId, currentSlug, msg.url)
       break
     case 'navigate':
-      handleNavigate(id, args.tabId, args.url)
+      handleNavigate(callId, msg.tabId, msg.url)
       break
     case 'read_page':
-      handleReadPage(id, args.selector, args.maxChars, args.tabId, args.frameId)
+      handleReadPage(callId, msg.selector, msg.maxChars, msg.tabId, msg.frameId)
       break
     default:
-      sendServiceError(id, 'unknown function: ' + f)
+      sendToolResponse(callId, 'unknown function: ' + f, 1)
   }
 }
 
-function handleToolsQuery (data) {
-  const queryId = data.id || ''
-  wsSend({
-    stream: 'tools_response',
-    data: {
-      id: queryId,
-      tools: [
-        { who: 'shotgun', f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
-        { who: 'shotgun', f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
-        { who: 'shotgun', f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
-        { who: 'shotgun', f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
-        { who: 'shotgun', f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
-        { who: 'shotgun', f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional).' }
-      ]
-    }
-  })
+function sendToolResponse (callId, output, exitCode) {
+  wsSend({ what: 'tool', why: 'response', call_id: callId, output, exit_code: exitCode || 0 })
+}
+
+function sendToolResult (callId, result) {
+  const output = JSON.stringify(result)
+  sendToolResponse(callId, output, result.error ? 1 : 0)
+}
+
+function sendToolError (callId, message) {
+  sendToolResponse(callId, message, 1)
 }
 
 // -- Tab tools --
 
-async function handleTabsContext (requestId, slug) {
+async function handleTabsContext (callId, slug) {
   try {
     const context = await getTabContext(slug)
-    sendServiceResult(requestId, { output: JSON.stringify(context, null, 2), tabContext: context })
+    sendToolResult(callId, { output: JSON.stringify(context, null, 2), tabContext: context })
   } catch (e) {
-    sendServiceResult(requestId, { error: e.message || 'tabs_context failed' })
+    sendToolError(callId, e.message || 'tabs_context failed')
   }
 }
 
-async function handleTabsCreate (requestId, slug, url) {
+async function handleTabsCreate (callId, slug, url) {
   try {
     const result = await createTabInGroup(slug, url)
-    sendServiceResult(requestId, result)
+    sendToolResult(callId, result)
   } catch (e) {
-    sendServiceResult(requestId, { error: e.message || 'tabs_create failed' })
+    sendToolError(callId, e.message || 'tabs_create failed')
   }
 }
 
-async function handleNavigate (requestId, tabId, url) {
+async function handleNavigate (callId, tabId, url) {
   if (!tabId || !url) {
-    sendServiceResult(requestId, { error: 'tabId and url are required' })
+    sendToolError(callId, 'tabId and url are required')
     return
   }
   try {
     const result = await navigateTab(tabId, url)
-    sendServiceResult(requestId, result)
+    sendToolResult(callId, result)
   } catch (e) {
-    sendServiceResult(requestId, { error: e.message || 'navigate failed' })
+    sendToolError(callId, e.message || 'navigate failed')
   }
 }
 
@@ -377,15 +377,15 @@ async function handleNavigate (requestId, tabId, url) {
 // Reads the DOM through the content script, not through Runtime.evaluate.
 // The page cannot see this. No CDP, no debugger, no page-world execution.
 
-async function handleReadPage (requestId, selector, maxChars, tabId, frameId) {
+async function handleReadPage (callId, selector, maxChars, tabId, frameId) {
   try {
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendServiceResult(requestId, { error: 'No tab found' })
+      sendToolError(callId, 'No tab found')
       return
     }
     // frameId 0 = top frame. Content script is in all frames but we
-    // default to top. Pass frameId in args to read a specific iframe.
+    // default to top. Pass frameId to read a specific iframe.
     const targetFrame = frameId != null ? frameId : 0
     const response = await chrome.tabs.sendMessage(resolvedTabId, {
       type: 'read_page',
@@ -393,12 +393,12 @@ async function handleReadPage (requestId, selector, maxChars, tabId, frameId) {
       maxChars: maxChars || 50000
     }, { frameId: targetFrame })
     if (response.error) {
-      sendServiceResult(requestId, { error: response.error })
+      sendToolError(callId, response.error)
     } else {
-      sendServiceResult(requestId, { output: response.text, title: response.title, url: response.url, selector: response.selector, length: response.length })
+      sendToolResult(callId, { output: response.text, title: response.title, url: response.url, selector: response.selector, length: response.length })
     }
   } catch (e) {
-    sendServiceResult(requestId, { error: e.message || 'read_page failed' })
+    sendToolError(callId, e.message || 'read_page failed')
   }
 }
 
@@ -406,19 +406,19 @@ async function handleReadPage (requestId, selector, maxChars, tabId, frameId) {
 
 async function resolveTabId (tabId) {
   if (tabId) return tabId
-  if (currentRequestSlug) {
-    const context = await getTabContext(currentRequestSlug)
+  if (currentSlug) {
+    const context = await getTabContext(currentSlug)
     if (context && context.currentTabId) return context.currentTabId
   }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
   return tab ? tab.id : null
 }
 
-async function captureScreenshot (requestId, tabId) {
+async function captureScreenshot (callId, tabId) {
   try {
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendServiceError(requestId, 'no tab to capture')
+      sendToolError(callId, 'no tab to capture')
       return
     }
 
@@ -437,7 +437,7 @@ async function captureScreenshot (requestId, tabId) {
     })
 
     if (!probeResult || !probeResult.result) {
-      sendServiceError(requestId, 'failed to get viewport information')
+      sendToolError(callId, 'failed to get viewport information')
       return
     }
 
@@ -458,7 +458,7 @@ async function captureScreenshot (requestId, tabId) {
 
     const result = await chrome.debugger.sendCommand({ tabId: resolvedTabId }, 'Page.captureScreenshot', cdpParams)
     if (!result || !result.data) {
-      sendServiceError(requestId, 'CDP capture returned no data')
+      sendToolError(callId, 'CDP capture returned no data')
       return
     }
 
@@ -475,9 +475,14 @@ async function captureScreenshot (requestId, tabId) {
       screenshotHeight: targetH
     })
 
-    sendServiceResponse(requestId, 'image/jpeg', base64)
+    // Screenshot returns image content blocks, not plain output.
+    const content = JSON.stringify([
+      { type: 'text', text: `screenshot (image/jpeg)` },
+      { type: 'image', data: base64, mimeType: 'image/jpeg' }
+    ])
+    sendToolResponse(callId, content, 0)
   } catch (e) {
-    sendServiceError(requestId, e.message || 'screenshot failed')
+    sendToolError(callId, e.message || 'screenshot failed')
   }
 }
 
@@ -589,13 +594,9 @@ async function resizeInContentScript (tabId, base64, viewportW, viewportH, dpr, 
 
 // -- JavaScript execution --
 //
-// Runtime.evaluate in the page world via CDP. The sanitizer strips
-// credentials, tokens, cookies, and long strings from the return value before
-// it travels back through the WebSocket. Ported verbatim from Claude Web — the
-// patterns are theirs, the paranoia is earned.
-//
-  // The CDP call uses .then() instead of await so the service worker stays
-// responsive while synchronous JS (alert, confirm) freezes the renderer.
+// Runtime.evaluate in the page world via CDP. The CDP call uses .then()
+// instead of await so the service worker stays responsive while synchronous
+// JS (alert, confirm) freezes the renderer.
 
 const JS_TIMEOUT = 10000
 const JS_MAX_OUTPUT = 51200
@@ -642,16 +643,16 @@ function formatResult (cdpResult) {
   return { output }
 }
 
-async function executeJavascript (requestId, code, tabId) {
+async function executeJavascript (callId, code, tabId) {
   try {
     if (!code) {
-      sendServiceResult(requestId, { error: 'Code parameter is required' })
+      sendToolError(callId, 'Code parameter is required')
       return
     }
 
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendServiceResult(requestId, { error: 'No tab found' })
+      sendToolError(callId, 'No tab found')
       return
     }
 
@@ -673,51 +674,12 @@ async function executeJavascript (requestId, code, tabId) {
       'Runtime.evaluate',
       { expression, returnByValue: true, awaitPromise: true, timeout: JS_TIMEOUT }
     ).then(
-      result => sendServiceResult(requestId, formatResult(result)),
-      err => sendServiceResult(requestId, {
-        error: `Failed to execute JavaScript: ${err.message || 'Unknown error'}`
-      })
+      result => sendToolResult(callId, formatResult(result)),
+      err => sendToolError(callId, `Failed to execute JavaScript: ${err.message || 'Unknown error'}`)
     )
   } catch (e) {
-    sendServiceResult(requestId, {
-      error: `Failed to execute JavaScript: ${e.message || 'Unknown error'}`
-    })
+    sendToolError(callId, `Failed to execute JavaScript: ${e.message || 'Unknown error'}`)
   }
-}
-
-// -- Response helpers --
-//
-// Three flavors: binary (screenshots), JSON (tool results), and plain text
-// (errors). All carry slug and timestamp for routing. sendServiceResponse
-// passes base64 through as-is (already encoded by CDP). sendServiceResult and
-// sendServiceError encode via utf8ToBase64 because the content may have
-// unicode.
-
-function sendServiceResponse (requestId, contentType, base64Body) {
-  wsSend({
-    stream: 'response',
-    slug: currentRequestSlug,
-    timestamp: currentRequestTimestamp,
-    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: contentType, body: base64Body }
-  })
-}
-
-function sendServiceResult (requestId, result) {
-  wsSend({
-    stream: 'response',
-    slug: currentRequestSlug,
-    timestamp: currentRequestTimestamp,
-    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'application/json', body: utf8ToBase64(JSON.stringify(result)) }
-  })
-}
-
-function sendServiceError (requestId, message) {
-  wsSend({
-    stream: 'response',
-    slug: currentRequestSlug,
-    timestamp: currentRequestTimestamp,
-    data: { id: requestId, slug: currentRequestSlug, timestamp: currentRequestTimestamp, content_type: 'text/plain', body: utf8ToBase64(message) }
-  })
 }
 
 // -- Connect on startup --
