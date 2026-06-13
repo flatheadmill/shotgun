@@ -1,171 +1,73 @@
+import { ProtocolAdapter } from './panel/adapter.js'
+import { TranscriptModel } from './panel/model.js'
+import './panel/components/transcript.js'
+import './panel/components/code-block.js'
+
 const input = document.getElementById('input')
 const button = document.getElementById('send')
-const content = document.getElementById('content')
+const transcript = document.getElementById('transcript')
+
+const adapter = new ProtocolAdapter()
+const model = new TranscriptModel()
 
 let roundActive = false
 
-button.addEventListener('click', send)
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') send()
+transcript.state = model.snapshot()
+
+adapter.addEventListener('event', (event) => {
+  model.apply(event.detail)
+})
+
+model.addEventListener('change', () => {
+  transcript.state = model.snapshot()
+})
+
+transcript.addEventListener('sg-toggle-tool', (event) => {
+  model.setToolExpanded(event.detail.key, event.detail.expanded)
+})
+
+button.addEventListener('click', () => {
+  if (roundActive) interrupt()
+  else send()
+})
+
+input.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey && !roundActive) send()
 })
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type !== 'envelope') return
-  const envelope = message.envelope
-
-  switch (envelope.stream) {
-    case 'entry':
-      renderEntry(envelope.data)
-      break
-
-    case 'delta':
-      renderDelta(envelope.data)
-      break
-
-    case 'lifecycle': {
-      const event = typeof envelope.data === 'string'
-        ? envelope.data
-        : Object.keys(envelope.data)[0] || ''
-      if (event === 'round_started') {
-        roundActive = true
-        setInputEnabled(false)
-      } else if (event === 'round_completed' || event === 'round_interrupted') {
-        roundActive = false
-        finishStreaming()
-        setInputEnabled(true)
-      }
-      break
-    }
-
-    case 'connected':
-      append('system', '(connected)')
-      break
-
-    case 'disconnect':
-      append('system', '(disconnected)')
-      roundActive = false
-      setInputEnabled(true)
-      break
-
-    case 'usage':
-      break
-
-    case 'error': {
-      const msg = envelope.data && envelope.data.message
-        ? envelope.data.message : 'unknown error'
-      append('system', msg)
-      break
-    }
-  }
+  const events = adapter.ingestEnvelope(message.envelope)
+  for (const event of events) updateRoundState(event)
 })
 
-function setInputEnabled (enabled) {
-  button.disabled = !enabled
-  input.disabled = !enabled
-  if (enabled) input.focus()
+function updateRoundState (event) {
+  if (event.type === 'lifecycle' && event.code === 'round_started') setRoundActive(true)
+  if (event.type === 'lifecycle' && (event.code === 'round_completed' || event.code === 'round_interrupted')) setRoundActive(false)
+  if (event.type === 'session.disconnected' || event.type === 'error') setRoundActive(false)
+}
+
+function setRoundActive (active) {
+  roundActive = active
+  input.disabled = active
+  button.disabled = false
+  button.textContent = active ? 'Stop' : 'Send'
+  button.title = active ? 'Interrupt' : 'Send'
+  button.dataset.mode = active ? 'interrupt' : 'send'
+  if (!active) input.focus()
 }
 
 function send () {
   const text = input.value.trim()
-  if (!text) return
-
-  append('you', text)
+  if (!text || roundActive) return
+  model.apply(adapter.localUserEntry(text))
   input.value = ''
-  setInputEnabled(false)
-
+  setRoundActive(true)
   chrome.runtime.sendMessage({ type: 'send', text })
 }
 
-// -- Entry rendering (history and complete entries from transcript) --
-
-function renderEntry (data) {
-  if (!data || !data.blocks) return
-  if (data.kind === 'user') {
-    for (const block of data.blocks) {
-      if (block.type === 'text') {
-        append('you', block.text)
-      }
-    }
-    return
-  }
-
-  for (const block of data.blocks) {
-    if (block.type === 'thinking') {
-      append('thinking', block.text)
-    } else if (block.type === 'text') {
-      append('claude', block.text)
-    } else if (block.type === 'tool_use') {
-      append('tool', block.name + ' ' + block.input_summary)
-    } else if (block.type === 'tool_result') {
-      const prefix = block.is_error ? '[error] ' : ''
-      append('tool', prefix + truncate(block.content, 200))
-    }
-  }
-}
-
-// -- Delta rendering (streaming) --
-
-let streamingEl = null
-let streamingType = null
-
-function renderDelta (data) {
-  const type = data.type
-  if (!type) return
-
-  if (type === 'content_block_start') {
-    const block = data.content_block
-    if (!block) return
-    if (block.type === 'text') {
-      streamingEl = createStreamingEl('claude')
-      streamingType = 'text'
-    } else if (block.type === 'thinking') {
-      streamingEl = createStreamingEl('thinking')
-      streamingType = 'thinking'
-    } else if (block.type === 'tool_use') {
-      streamingType = 'tool_use'
-      streamingEl = null
-    }
-  } else if (type === 'content_block_delta') {
-    const delta = data.delta
-    if (!delta) return
-    if (streamingType === 'text' && delta.type === 'text_delta' && streamingEl) {
-      streamingEl.textContent += delta.text
-      content.scrollTop = content.scrollHeight
-    } else if (streamingType === 'thinking' && delta.type === 'thinking_delta' && streamingEl) {
-      streamingEl.textContent += delta.thinking
-      content.scrollTop = content.scrollHeight
-    }
-  } else if (type === 'content_block_stop') {
-    streamingEl = null
-    streamingType = null
-  }
-}
-
-function createStreamingEl (role) {
-  const div = document.createElement('div')
-  div.className = 'message ' + role
-  content.appendChild(div)
-  return div
-}
-
-function finishStreaming () {
-  streamingEl = null
-  streamingType = null
-}
-
-// -- Helpers --
-
-function append (role, text) {
-  const div = document.createElement('div')
-  div.className = 'message ' + role
-  div.textContent = text
-  content.appendChild(div)
-  content.scrollTop = content.scrollHeight
-}
-
-function truncate (s, max) {
-  if (!s) return ''
-  return s.length <= max ? s : s.slice(0, max) + '...'
+function interrupt () {
+  chrome.runtime.sendMessage({ type: 'interrupt' })
 }
 
 chrome.runtime.sendMessage({ type: 'connect' })

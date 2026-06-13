@@ -149,6 +149,24 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 let ws = null
 let heartbeatInterval = null
 
+// Shotgun binds to one slug and always the latest transcript. Easement resolves
+// the intent "latest" to a timestamped transcript on its side; we learn the
+// resolved name from the broadcasts it sends back and use it when starting a
+// turn, because Turn::Start keys its window on the raw transcript string and
+// will not resolve "latest" the way history replay does.
+const SLUG = 'shotgun'
+const TRANSCRIPT_INTENT = 'latest'
+let resolvedTranscript = null
+let activeTurnId = null
+let pendingHistory = false
+
+// Replay this slug's latest transcript. Driven by the panel's connect message
+// so a listener exists; wsSend is a no-op until the socket is open, so when the
+// panel connects before the socket opens we defer via pendingHistory.
+function requestHistory () {
+  wsSend({ what: 'history', why: 'replay', slug: SLUG, transcript: TRANSCRIPT_INTENT, replay_id: crypto.randomUUID() })
+}
+
 const TOOLS = [
   { f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
   { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
@@ -178,6 +196,16 @@ function ensureConnection () {
     // Register with Easement. Tools declared here, not via tools_query.
     wsSend({ what: 'socket', why: 'connect', who: 'shotgun', where: 'localhost', tools: TOOLS })
 
+    // The socket opens on the worker's lifecycle, which can precede the panel
+    // mounting. Replaying history here would forward the transcript into a
+    // sendMessage with no listening panel, and it would be dropped. The replay
+    // is driven by the panel's connect message instead. If the panel asked
+    // while the socket was still connecting, honor that request now.
+    if (pendingHistory) {
+      pendingHistory = false
+      requestHistory()
+    }
+
     if (heartbeatInterval) clearInterval(heartbeatInterval)
     heartbeatInterval = setInterval(() => {
       wsSend({ stream: 'heartbeat', data: {} })
@@ -193,6 +221,15 @@ function ensureConnection () {
       if (msg.what === 'tool' && msg.why === 'run') {
         handleToolRun(msg)
         return
+      }
+
+      // Broadcasts go to every connected client and carry their slug. Ignore
+      // traffic for other slugs so the panel only sees its own transcript.
+      if (typeof msg.slug === 'string' && msg.slug !== SLUG) return
+
+      // Learn the transcript Easement resolved "latest" to, for turn routing.
+      if (typeof msg.transcript === 'string' && msg.transcript !== TRANSCRIPT_INTENT) {
+        resolvedTranscript = msg.transcript
       }
 
       // Everything else forwards to the side panel.
@@ -216,11 +253,24 @@ function ensureConnection () {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'connect') {
     ensureConnection()
+    // Request history now if the socket is already open, otherwise let the
+    // open handler send it once the socket comes up. Either way the panel's
+    // listener is live, because it registers before sending connect.
+    if (ws && ws.readyState === WebSocket.OPEN) requestHistory()
+    else pendingHistory = true
     return
   }
   if (message.type === 'send') {
     ensureConnection()
-    wsSend({ stream: 'claude', data: { message: message.text } })
+    activeTurnId = crypto.randomUUID()
+    wsSend({
+      what: 'turn',
+      why: 'start',
+      slug: SLUG,
+      transcript: resolvedTranscript || TRANSCRIPT_INTENT,
+      turn_id: activeTurnId,
+      message: message.text
+    })
     return
   }
   if (message.type === 'approve') {
@@ -228,7 +278,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return
   }
   if (message.type === 'interrupt') {
-    wsSend({ stream: 'interrupt', data: {} })
+    wsSend({
+      what: 'turn',
+      why: 'interrupt',
+      slug: SLUG,
+      transcript: resolvedTranscript || TRANSCRIPT_INTENT,
+      turn_id: activeTurnId
+    })
     return
   }
 })
