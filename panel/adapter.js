@@ -1,3 +1,12 @@
+// This is the only file that knows what Easement puts on the wire. Its job is
+// translation: socket messages in, a small and stable vocabulary of events out,
+// so that nothing downstream — not the model, not the components — ever sees a
+// raw broadcast. When the protocol shifts under us, and it will, this is the
+// file that changes, and ideally the only one. The events are block-first
+// because the native unit on the wire is a block within an entry; mirroring
+// that here spares the model from taking apart a message the wire already
+// delivered in pieces.
+
 export class ProtocolAdapter extends EventTarget {
   constructor () {
     super()
@@ -44,7 +53,6 @@ export class ProtocolAdapter extends EventTarget {
 
     switch (envelope.what) {
       case 'history':
-        console.log(envelope)
         return this.historyEvents(envelope)
       case 'turn':
         return this.turnEvents(envelope)
@@ -62,6 +70,15 @@ export class ProtocolAdapter extends EventTarget {
   }
 
   historyEvents (message) {
+    // The adapter holds no transcript of its own. It treats history as
+    // something to rebuild from a replay, never something to carry. We weighed
+    // caching history in the service worker so a reopened panel could paint
+    // without a round trip, but the service worker is itself fragile — Chrome
+    // kills it on idle — and a cache there is one more thing to invalidate and
+    // trust. The protocol is the simpler answer: a transcript stream is cheap
+    // to ask for and cheap to receive, so the panel asks for a replay and
+    // builds off it. When in doubt, wipe and re-render. Nothing here
+    // synthesizes what a fresh replay could not reconstruct.
     if (message.why === 'begin') {
       this.historyReplayId = message.replay_id || message.transcript || 'history'
       this.historyLastUuid = message.last_uuid || null
