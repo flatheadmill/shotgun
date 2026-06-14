@@ -76,7 +76,10 @@ async function ensureGroupCharacteristics (slug, groupId) {
     if (group.title !== slug || group.color !== GROUP_COLOR) {
       await chrome.tabGroups.update(groupId, { title: slug, color: GROUP_COLOR })
     }
-  } catch (e) {}
+  } catch (e) {
+    // Best effort. The group is cosmetic, and it may have been closed between
+    // the lookup and the update; there is nothing to repair if it is gone.
+  }
 }
 
 async function getTabContext (slug) {
@@ -177,7 +180,15 @@ const TOOLS = [
 ]
 
 function forward (msg) {
-  chrome.runtime.sendMessage({ type: 'envelope', envelope: msg }).catch(() => {})
+  // With no panel open there is no receiving end and sendMessage rejects.
+  // That case is expected and nothing is lost worth keeping — the panel
+  // rebuilds from a replay when it opens. Swallow only that rejection;
+  // surface anything else rather than hide it the way the old bare catch did.
+  chrome.runtime.sendMessage({ type: 'envelope', envelope: msg }).catch((e) => {
+    if (!/Receiving end does not exist/.test(e?.message || '')) {
+      console.error('shotgun: forward failed', e)
+    }
+  })
 }
 
 function wsSend (obj) {
@@ -214,27 +225,34 @@ function ensureConnection () {
   })
 
   ws.addEventListener('message', (event) => {
+    // Only the parse can fail on a malformed frame off the wire. Guard that
+    // narrowly and say so when it happens; do not wrap our own dispatch logic
+    // below in a catch, where it would swallow real bugs into silence.
+    let msg
     try {
-      const msg = JSON.parse(event.data)
+      msg = JSON.parse(event.data)
+    } catch (e) {
+      console.error('shotgun: dropping unparseable frame', e, event.data)
+      return
+    }
 
-      // Tool dispatch from Easement. Tagged with what=tool, why=run.
-      if (msg.what === 'tool' && msg.why === 'run') {
-        handleToolRun(msg)
-        return
-      }
+    // Tool dispatch from Easement. Tagged with what=tool, why=run.
+    if (msg.what === 'tool' && msg.why === 'run') {
+      handleToolRun(msg)
+      return
+    }
 
-      // Broadcasts go to every connected client and carry their slug. Ignore
-      // traffic for other slugs so the panel only sees its own transcript.
-      if (typeof msg.slug === 'string' && msg.slug !== SLUG) return
+    // Broadcasts go to every connected client and carry their slug. Ignore
+    // traffic for other slugs so the panel only sees its own transcript.
+    if (typeof msg.slug === 'string' && msg.slug !== SLUG) return
 
-      // Learn the transcript Easement resolved "latest" to, for turn routing.
-      if (typeof msg.transcript === 'string' && msg.transcript !== TRANSCRIPT_INTENT) {
-        resolvedTranscript = msg.transcript
-      }
+    // Learn the transcript Easement resolved "latest" to, for turn routing.
+    if (typeof msg.transcript === 'string' && msg.transcript !== TRANSCRIPT_INTENT) {
+      resolvedTranscript = msg.transcript
+    }
 
-      // Everything else forwards to the side panel.
-      forward(msg)
-    } catch (e) {}
+    // Everything else forwards to the side panel.
+    forward(msg)
   })
 
   ws.addEventListener('close', () => {
