@@ -266,7 +266,7 @@ function ensureConnection () {
 
     if (heartbeatInterval) clearInterval(heartbeatInterval)
     heartbeatInterval = setInterval(() => {
-      wsSend({ stream: 'heartbeat', data: {} })
+      wsSend({ what: 'socket', why: 'heartbeat' })
     }, 20000)
     forward({ stream: 'connected', data: {} })
   })
