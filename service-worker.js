@@ -198,24 +198,6 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 let ws = null
 let heartbeatInterval = null
 
-// Shotgun binds to one slug and always the latest transcript. Easement resolves
-// the intent "latest" to a timestamped transcript on its side; we learn the
-// resolved name from the broadcasts it sends back and use it when starting a
-// turn, because Turn::Start keys its window on the raw transcript string and
-// will not resolve "latest" the way history replay does.
-const SLUG = 'shotgun'
-const TRANSCRIPT_INTENT = 'latest'
-let resolvedTranscript = null
-let activeTurnId = null
-let pendingHistory = false
-
-// Replay this slug's latest transcript. Driven by the panel's connect message
-// so a listener exists; wsSend is a no-op until the socket is open, so when the
-// panel connects before the socket opens we defer via pendingHistory.
-function requestHistory () {
-  wsSend({ what: 'history', why: 'replay', slug: SLUG, transcript: TRANSCRIPT_INTENT, replay_id: crypto.randomUUID() })
-}
-
 const TOOLS = [
   { f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
   { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
@@ -225,18 +207,6 @@ const TOOLS = [
   { f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional), frameId (int, optional, default 0 for top frame).' },
   { f: 'read_network_requests', description: 'Read HTTP requests (XHR, fetch, documents, images) captured from a tab via passive CDP network logging. Tracking starts on the first call for a tab; the buffer clears when the tab navigates to a new domain. Args: tabId (int, optional), urlPattern (string, optional — only requests whose URL contains it), clear (bool, optional — clear after reading to avoid duplicates), limit (int, optional, default 100).' },
 ]
-
-function forward (msg) {
-  // With no panel open there is no receiving end and sendMessage rejects.
-  // That case is expected and nothing is lost worth keeping — the panel
-  // rebuilds from a replay when it opens. Swallow only that rejection;
-  // surface anything else rather than hide it the way the old bare catch did.
-  chrome.runtime.sendMessage({ type: 'envelope', envelope: msg }).catch((e) => {
-    if (!/Receiving end does not exist/.test(e?.message || '')) {
-      console.error('shotgun: forward failed', e)
-    }
-  })
-}
 
 function wsSend (obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -254,21 +224,10 @@ function ensureConnection () {
     // Register with Easement. Tools declared here, not via tools_query.
     wsSend({ what: 'socket', why: 'connect', who: 'shotgun', where: 'localhost', tools: TOOLS })
 
-    // The socket opens on the worker's lifecycle, which can precede the panel
-    // mounting. Replaying history here would forward the transcript into a
-    // sendMessage with no listening panel, and it would be dropped. The replay
-    // is driven by the panel's connect message instead. If the panel asked
-    // while the socket was still connecting, honor that request now.
-    if (pendingHistory) {
-      pendingHistory = false
-      requestHistory()
-    }
-
     if (heartbeatInterval) clearInterval(heartbeatInterval)
     heartbeatInterval = setInterval(() => {
       wsSend({ what: 'socket', why: 'heartbeat' })
     }, 20000)
-    forward({ stream: 'connected', data: {} })
   })
 
   ws.addEventListener('message', (event) => {
@@ -289,70 +248,20 @@ function ensureConnection () {
       return
     }
 
-    // Broadcasts go to every connected client and carry their slug. Ignore
-    // traffic for other slugs so the panel only sees its own transcript.
-    if (typeof msg.slug === 'string' && msg.slug !== SLUG) return
-
-    // Learn the transcript Easement resolved "latest" to, for turn routing.
-    if (typeof msg.transcript === 'string' && msg.transcript !== TRANSCRIPT_INTENT) {
-      resolvedTranscript = msg.transcript
-    }
-
-    // Everything else forwards to the side panel.
-    forward(msg)
+    // The side-panel conversation surface was retired by decision with the
+    // print-era bus. Shotgun receives tool dispatches; it no longer drives or
+    // renders conversations. Unexpected frames are observed by logging.
   })
 
   ws.addEventListener('close', () => {
     ws = null
     if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null }
-    forward({ stream: 'disconnect', data: {} })
   })
 
   ws.addEventListener('error', () => {
     if (ws) { ws.close(); ws = null }
   })
 }
-
-// -- Side panel messages --
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'connect') {
-    ensureConnection()
-    // Request history now if the socket is already open, otherwise let the
-    // open handler send it once the socket comes up. Either way the panel's
-    // listener is live, because it registers before sending connect.
-    if (ws && ws.readyState === WebSocket.OPEN) requestHistory()
-    else pendingHistory = true
-    return
-  }
-  if (message.type === 'send') {
-    ensureConnection()
-    activeTurnId = crypto.randomUUID()
-    wsSend({
-      what: 'turn',
-      why: 'start',
-      slug: SLUG,
-      transcript: resolvedTranscript || TRANSCRIPT_INTENT,
-      turn_id: activeTurnId,
-      message: message.text
-    })
-    return
-  }
-  if (message.type === 'approve') {
-    wsSend({ stream: 'approval', data: message.data })
-    return
-  }
-  if (message.type === 'interrupt') {
-    wsSend({
-      what: 'turn',
-      why: 'interrupt',
-      slug: SLUG,
-      transcript: resolvedTranscript || TRANSCRIPT_INTENT,
-      turn_id: activeTurnId
-    })
-    return
-  }
-})
 
 // -- Debugger lifecycle --
 //
