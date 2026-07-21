@@ -4,8 +4,9 @@
 // time. Easement dispatches tool calls directly to our socket — no
 // broadcast, no claims.
 //
-// Six tools: screenshot, javascript, tabs_context, tabs_create, navigate,
-// read_page. Tab groups are per-slug, persisted in chrome.storage.local.
+// Seven tools: screenshot, javascript, tabs_context, tabs_create, navigate,
+// read_page, read_network_requests. Tab groups are per-slug, persisted in
+// chrome.storage.local.
 //
 // Screenshot pipeline ported from Claude Web 1.0.72
 // (mcpPermissions-CUBzZeeG.js). Reference at ~/code/reference/claude-web/.
@@ -28,6 +29,51 @@ const MIN_JPEG_QUALITY = 0.10
 
 const attachedTabs = new Set()
 const screenshotContexts = new Map()
+
+// -- Network capture state --
+//
+// Passive CDP network logging. Network.enable on a tab streams
+// requestWillBeSent / responseReceived events; we keep a per-tab buffer of
+// { requestId, url, method, status }. The buffer resets when the tab navigates
+// to a new domain and is capped so a long-lived tab cannot grow without bound.
+// This is the substrate the extendable observers will pull from; for now it
+// backs the read_network_requests tool.
+//
+// Tracking is enabled lazily on the first read for a tab and left on — the same
+// attach-once philosophy as ensureDebugger. Claude Web toggles
+// Network.disable/enable on every read; we do not, because the buffer is ours
+// (JS side, not CDP) so there is nothing to reset, and the toggle would race
+// against events arriving during its settle gap.
+const networkRequestsByTab = new Map()
+const networkTrackingTabs = new Set()
+const MAX_NETWORK_REQUESTS_PER_TAB = 1000
+
+function extractDomain (url) {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
+  }
+}
+
+function addNetworkRequest (tabId, domain, record) {
+  let entry = networkRequestsByTab.get(tabId)
+  if (entry) {
+    // A domain change means a new page; the prior page's requests are no longer
+    // what a caller is asking about, so drop them.
+    if (entry.domain !== domain) {
+      entry.domain = domain
+      entry.requests = []
+    }
+  } else {
+    entry = { domain, requests: [] }
+    networkRequestsByTab.set(tabId, entry)
+  }
+  entry.requests.push(record)
+  if (entry.requests.length > MAX_NETWORK_REQUESTS_PER_TAB) {
+    entry.requests.splice(0, entry.requests.length - MAX_NETWORK_REQUESTS_PER_TAB)
+  }
+}
 
 function utf8ToBase64 (str) {
   // btoa chokes on non-Latin1. Page content has unicode.
@@ -177,6 +223,7 @@ const TOOLS = [
   { f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
   { f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
   { f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional), frameId (int, optional, default 0 for top frame).' },
+  { f: 'read_network_requests', description: 'Read HTTP requests (XHR, fetch, documents, images) captured from a tab via passive CDP network logging. Tracking starts on the first call for a tab; the buffer clears when the tab navigates to a new domain. Args: tabId (int, optional), urlPattern (string, optional — only requests whose URL contains it), clear (bool, optional — clear after reading to avoid duplicates), limit (int, optional, default 100).' },
 ]
 
 function forward (msg) {
@@ -320,13 +367,49 @@ async function ensureDebugger (tabId) {
 }
 
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId) attachedTabs.delete(source.tabId)
+  if (source.tabId) {
+    attachedTabs.delete(source.tabId)
+    networkTrackingTabs.delete(source.tabId)
+    networkRequestsByTab.delete(source.tabId)
+  }
 })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId)
   screenshotContexts.delete(tabId)
+  networkTrackingTabs.delete(tabId)
+  networkRequestsByTab.delete(tabId)
 })
+
+// -- Network event capture --
+//
+// One listener serves every attached tab. requestWillBeSent opens a record
+// keyed by the page's domain; responseReceived and loadingFailed fill in the
+// status. The domain comes from documentURL when present so subframe requests
+// still attribute to the page, falling back to the request URL.
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source.tabId
+  if (!tabId) return
+  if (method === 'Network.requestWillBeSent') {
+    const record = { requestId: params.requestId, url: params.request.url, method: params.request.method }
+    addNetworkRequest(tabId, extractDomain(params.documentURL || params.request.url), record)
+  } else if (method === 'Network.responseReceived') {
+    const entry = networkRequestsByTab.get(tabId)
+    const req = entry && entry.requests.find(r => r.requestId === params.requestId)
+    if (req) req.status = params.response.status
+  } else if (method === 'Network.loadingFailed') {
+    const entry = networkRequestsByTab.get(tabId)
+    const req = entry && entry.requests.find(r => r.requestId === params.requestId)
+    if (req) req.status = 503
+  }
+})
+
+async function enableNetworkTracking (tabId) {
+  await ensureDebugger(tabId)
+  if (networkTrackingTabs.has(tabId)) return
+  await chrome.debugger.sendCommand({ tabId }, 'Network.enable', { maxPostDataSize: 65536 })
+  networkTrackingTabs.add(tabId)
+}
 
 // -- Token budget resize (from Claude Web) --
 //
@@ -394,6 +477,9 @@ function handleToolRun (msg) {
       break
     case 'read_page':
       handleReadPage(callId, msg.selector, msg.maxChars, msg.tabId, msg.frameId)
+      break
+    case 'read_network_requests':
+      handleReadNetworkRequests(callId, msg.tabId, msg.urlPattern, msg.clear, msg.limit)
       break
     default:
       sendToolResponse(callId, 'unknown function: ' + f, 1)
@@ -473,6 +559,60 @@ async function handleReadPage (callId, selector, maxChars, tabId, frameId) {
     }
   } catch (e) {
     sendToolError(callId, e.message || 'read_page failed')
+  }
+}
+
+// -- Network requests (passive CDP capture, ported from Claude Web 1.0.72) --
+//
+// Enable tracking on the tab if it is not already on, read the accumulated
+// buffer, optionally filter by URL substring, optionally clear to avoid
+// duplicates on the next call. No JavaScript injection, no DOM — the only
+// page-side trace is the debugger bar any CDP tool already raises.
+async function handleReadNetworkRequests (callId, tabId, urlPattern, clear, limit) {
+  try {
+    const resolvedTabId = await resolveTabId(tabId)
+    if (!resolvedTabId) {
+      sendToolError(callId, 'No tab found')
+      return
+    }
+    await enableNetworkTracking(resolvedTabId)
+
+    const entry = networkRequestsByTab.get(resolvedTabId)
+    let requests = entry ? entry.requests : []
+    if (urlPattern) requests = requests.filter(r => r.url.includes(urlPattern))
+
+    const max = limit || 100
+    const tabContext = await getTabContext(currentSlug)
+
+    if (requests.length === 0) {
+      if (clear) networkRequestsByTab.delete(resolvedTabId)
+      const what = urlPattern ? `requests matching "${urlPattern}"` : 'network requests'
+      sendToolResult(callId, {
+        output: `No ${what} found for tab ${resolvedTabId}.\n\nTracking starts when this tool is first called for a tab. If the page loaded before that, reload it or take an action that triggers requests, then read again.`,
+        requests: [],
+        tabContext
+      })
+      return
+    }
+
+    const shown = requests.slice(0, max)
+    const truncated = requests.length > max
+    if (clear) networkRequestsByTab.delete(resolvedTabId)
+
+    const lines = shown
+      .map((r, i) => `${i + 1}. url: ${r.url}\n   method: ${r.method}\n   statusCode: ${r.status || 'pending'}`)
+      .join('\n\n')
+    const filterNote = urlPattern ? ` (filtered by URL pattern "${urlPattern}")` : ''
+    const truncNote = truncated ? ` (showing first ${max} of ${requests.length})` : ''
+    const header = `Found ${requests.length} network request${requests.length === 1 ? '' : 's'}${filterNote}${truncNote}:`
+
+    sendToolResult(callId, {
+      output: `${header}\n\n${lines}`,
+      requests: shown,
+      tabContext
+    })
+  } catch (e) {
+    sendToolError(callId, e.message || 'read_network_requests failed')
   }
 }
 
