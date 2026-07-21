@@ -12,7 +12,7 @@ export function record (who, what, fields = {}) {
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined) continue
     if (ANCHORS.has(key)) {
-      event[key] = value
+      event[key] = String(value)
     } else {
       details[key] = value
     }

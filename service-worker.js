@@ -19,6 +19,10 @@ import { error as logError, trace } from './log.js'
 const EASEMENT_URL = 'ws://127.0.0.1:6502'
 const BROWSER = 'localhost'
 
+// MV3 may emit this again each time an alarm resurrects an idle worker while
+// Easement is down. The console sink dies with that worker, so the churn is
+// self-limiting today. Revisit it when emit gains a durable Easement endpoint;
+// that sink is unavailable in the one condition that produces the churn.
 trace('lifecycle', 'start', { where: BROWSER, how: 'service_worker' })
 
 const GROUP_COLOR = 'yellow'
@@ -240,6 +244,10 @@ function ensureConnection () {
   if (ws && ws.readyState === WebSocket.OPEN) return
   if (ws && ws.readyState === WebSocket.CONNECTING) return
 
+  // Connection logging is transition-only: disconnect on losing an open
+  // socket, connect on recovery, and no line for each failed attempt. A worker
+  // cold-starting while Easement is already down therefore emits lifecycle
+  // start but no fail_connect; that silence is deliberate, not an omission.
   const socket = new WebSocket(EASEMENT_URL)
   let opened = false
   let heartbeat = null
@@ -455,7 +463,7 @@ function handleToolRun (msg) {
       handleReadNetworkRequests(callId, msg.tabId, msg.urlPattern, msg.clear, msg.limit)
       break
     default:
-      sendToolError(callId, 'unknown function: ' + f)
+      sendToolReject(callId, 'unknown function: ' + f)
   }
 }
 
@@ -476,13 +484,18 @@ function sendToolResponse (callId, output, exitCode) {
 function sendToolResult (callId, result) {
   const output = JSON.stringify(result)
   if (result.error) {
-    trace('tool', 'reject', { why: result.error, call_id: callId })
+    trace('tool', 'fail_run', { why: result.error, call_id: callId })
   }
   sendToolResponse(callId, output, result.error ? 1 : 0)
 }
 
-function sendToolError (callId, message) {
+function sendToolReject (callId, message) {
   trace('tool', 'reject', { why: message, call_id: callId })
+  sendToolResponse(callId, message, 1)
+}
+
+function sendToolFailure (callId, message) {
+  trace('tool', 'fail_run', { why: message, call_id: callId })
   sendToolResponse(callId, message, 1)
 }
 
@@ -493,7 +506,7 @@ async function handleTabsContext (callId, slug) {
     const context = await getTabContext(slug)
     sendToolResult(callId, { output: JSON.stringify(context, null, 2), tabContext: context })
   } catch (e) {
-    sendToolError(callId, e.message || 'tabs_context failed')
+    sendToolFailure(callId, e.message || 'tabs_context failed')
   }
 }
 
@@ -502,20 +515,20 @@ async function handleTabsCreate (callId, slug, url) {
     const result = await createTabInGroup(slug, url)
     sendToolResult(callId, result)
   } catch (e) {
-    sendToolError(callId, e.message || 'tabs_create failed')
+    sendToolFailure(callId, e.message || 'tabs_create failed')
   }
 }
 
 async function handleNavigate (callId, tabId, url) {
   if (!tabId || !url) {
-    sendToolError(callId, 'tabId and url are required')
+    sendToolReject(callId, 'tabId and url are required')
     return
   }
   try {
     const result = await navigateTab(tabId, url)
     sendToolResult(callId, result)
   } catch (e) {
-    sendToolError(callId, e.message || 'navigate failed')
+    sendToolFailure(callId, e.message || 'navigate failed')
   }
 }
 
@@ -528,7 +541,7 @@ async function handleReadPage (callId, selector, maxChars, tabId, frameId) {
   try {
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendToolError(callId, 'No tab found')
+      sendToolReject(callId, 'No tab found')
       return
     }
     // frameId 0 = top frame. Content script is in all frames but we
@@ -540,12 +553,12 @@ async function handleReadPage (callId, selector, maxChars, tabId, frameId) {
       maxChars: maxChars || 50000
     }, { frameId: targetFrame })
     if (response.error) {
-      sendToolError(callId, response.error)
+      sendToolFailure(callId, response.error)
     } else {
       sendToolResult(callId, { output: response.text, title: response.title, url: response.url, selector: response.selector, length: response.length })
     }
   } catch (e) {
-    sendToolError(callId, e.message || 'read_page failed')
+    sendToolFailure(callId, e.message || 'read_page failed')
   }
 }
 
@@ -559,7 +572,7 @@ async function handleReadNetworkRequests (callId, tabId, urlPattern, clear, limi
   try {
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendToolError(callId, 'No tab found')
+      sendToolReject(callId, 'No tab found')
       return
     }
     await enableNetworkTracking(resolvedTabId)
@@ -599,7 +612,7 @@ async function handleReadNetworkRequests (callId, tabId, urlPattern, clear, limi
       tabContext
     })
   } catch (e) {
-    sendToolError(callId, e.message || 'read_network_requests failed')
+    sendToolFailure(callId, e.message || 'read_network_requests failed')
   }
 }
 
@@ -619,7 +632,7 @@ async function captureScreenshot (callId, tabId) {
   try {
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendToolError(callId, 'no tab to capture')
+      sendToolReject(callId, 'no tab to capture')
       return
     }
 
@@ -638,7 +651,7 @@ async function captureScreenshot (callId, tabId) {
     })
 
     if (!probeResult || !probeResult.result) {
-      sendToolError(callId, 'failed to get viewport information')
+      sendToolFailure(callId, 'failed to get viewport information')
       return
     }
 
@@ -659,7 +672,7 @@ async function captureScreenshot (callId, tabId) {
 
     const result = await chrome.debugger.sendCommand({ tabId: resolvedTabId }, 'Page.captureScreenshot', cdpParams)
     if (!result || !result.data) {
-      sendToolError(callId, 'CDP capture returned no data')
+      sendToolFailure(callId, 'CDP capture returned no data')
       return
     }
 
@@ -683,7 +696,7 @@ async function captureScreenshot (callId, tabId) {
     ])
     sendToolResponse(callId, content, 0)
   } catch (e) {
-    sendToolError(callId, e.message || 'screenshot failed')
+    sendToolFailure(callId, e.message || 'screenshot failed')
   }
 }
 
@@ -847,13 +860,13 @@ function formatResult (cdpResult) {
 async function executeJavascript (callId, code, tabId) {
   try {
     if (!code) {
-      sendToolError(callId, 'Code parameter is required')
+      sendToolReject(callId, 'Code parameter is required')
       return
     }
 
     const resolvedTabId = await resolveTabId(tabId)
     if (!resolvedTabId) {
-      sendToolError(callId, 'No tab found')
+      sendToolReject(callId, 'No tab found')
       return
     }
 
@@ -876,10 +889,10 @@ async function executeJavascript (callId, code, tabId) {
       { expression, returnByValue: true, awaitPromise: true, timeout: JS_TIMEOUT }
     ).then(
       result => sendToolResult(callId, formatResult(result)),
-      err => sendToolError(callId, `Failed to execute JavaScript: ${err.message || 'Unknown error'}`)
+      err => sendToolFailure(callId, `Failed to execute JavaScript: ${err.message || 'Unknown error'}`)
     )
   } catch (e) {
-    sendToolError(callId, `Failed to execute JavaScript: ${e.message || 'Unknown error'}`)
+    sendToolFailure(callId, `Failed to execute JavaScript: ${e.message || 'Unknown error'}`)
   }
 }
 
