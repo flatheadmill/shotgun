@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Shotgun",
   "version": "0.0.1",
+  "minimum_chrome_version": "116",
   "description": "Claude as a browser companion",
   "permissions": [
     "sidePanel",
@@ -17,7 +18,8 @@
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "service-worker.js"
+    "service_worker": "service-worker.js",
+    "type": "module"
   },
   "side_panel": {
     "default_path": "sidepanel.html"

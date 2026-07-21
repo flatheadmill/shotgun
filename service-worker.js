@@ -14,6 +14,13 @@
 // that looked like credentials. We own the pipe. The operator sees
 // the transcript.
 
+import { error as logError, trace } from './log.js'
+
+const EASEMENT_URL = 'ws://127.0.0.1:6502'
+const BROWSER = 'localhost'
+
+trace('lifecycle', 'start', { where: BROWSER, how: 'service_worker' })
+
 const GROUP_COLOR = 'yellow'
 const STORAGE_KEY_PREFIX = 'shotgun_tab_group_'
 
@@ -105,6 +112,11 @@ async function loadTabGroupForSlug (slug) {
     tabGroups[slug] = id
     return id
   } catch {
+    trace('tabs', 'forget_group', {
+      why: 'the stored tab group no longer exists',
+      slug,
+      group_id: id
+    })
     await chrome.storage.local.remove(key)
     return null
   }
@@ -137,6 +149,11 @@ async function getTabContext (slug) {
     await chrome.tabGroups.get(groupId)
     await ensureGroupCharacteristics(slug, groupId)
   } catch {
+    trace('tabs', 'forget_group', {
+      why: 'the tab group vanished after validation',
+      slug,
+      group_id: groupId
+    })
     delete tabGroups[slug]
     const key = STORAGE_KEY_PREFIX + slug
     await chrome.storage.local.remove(key)
@@ -183,7 +200,11 @@ async function navigateTab (tabId, url) {
 // -- Side panel and action --
 
 chrome.action.onClicked.addListener(async (tab) => {
-  await chrome.sidePanel.open({ tabId: tab.id })
+  try {
+    await chrome.sidePanel.open({ tabId: tab.id })
+  } catch (e) {
+    logError('panel', 'fail_open', e, { tab_id: tab.id })
+  }
 })
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
@@ -196,7 +217,6 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
 // if the worker dies.
 
 let ws = null
-let heartbeatInterval = null
 
 const TOOLS = [
   { f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
@@ -211,26 +231,41 @@ const TOOLS = [
 function wsSend (obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj))
+    return true
   }
+  return false
 }
 
 function ensureConnection () {
   if (ws && ws.readyState === WebSocket.OPEN) return
   if (ws && ws.readyState === WebSocket.CONNECTING) return
 
-  ws = new WebSocket('ws://127.0.0.1:6502')
+  const socket = new WebSocket(EASEMENT_URL)
+  let opened = false
+  let heartbeat = null
+  ws = socket
 
-  ws.addEventListener('open', () => {
+  socket.addEventListener('open', () => {
+    opened = true
+    trace('websocket', 'connect', {
+      whom: 'easement',
+      where: BROWSER,
+      how: 'websocket'
+    })
+
     // Register with Easement. Tools declared here, not via tools_query.
     wsSend({ what: 'socket', why: 'connect', who: 'shotgun', where: 'localhost', tools: TOOLS })
 
-    if (heartbeatInterval) clearInterval(heartbeatInterval)
-    heartbeatInterval = setInterval(() => {
-      wsSend({ what: 'socket', why: 'heartbeat' })
+    // Unlike Wicket, Shotgun does not log every sent frame: heartbeats are a
+    // periodic condition, not an event, and must not flood the log.
+    heartbeat = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ what: 'socket', why: 'heartbeat' }))
+      }
     }, 20000)
   })
 
-  ws.addEventListener('message', (event) => {
+  socket.addEventListener('message', (event) => {
     // Only the parse can fail on a malformed frame off the wire. Guard that
     // narrowly and say so when it happens; do not wrap our own dispatch logic
     // below in a catch, where it would swallow real bugs into silence.
@@ -238,7 +273,12 @@ function ensureConnection () {
     try {
       msg = JSON.parse(event.data)
     } catch (e) {
-      console.error('shotgun: dropping unparseable frame', e, event.data)
+      logError('wire', 'reject', e, {
+        whom: 'easement',
+        where: BROWSER,
+        how: 'json',
+        raw: event.data
+      })
       return
     }
 
@@ -251,15 +291,31 @@ function ensureConnection () {
     // The side-panel conversation surface was retired by decision with the
     // print-era bus. Shotgun receives tool dispatches; it no longer drives or
     // renders conversations. Unexpected frames are observed by logging.
+    trace('wire', 'unrecognized', {
+      whom: 'easement',
+      where: BROWSER,
+      why: 'the frame is not a tool dispatch',
+      how: 'websocket',
+      raw: msg
+    })
   })
 
-  ws.addEventListener('close', () => {
-    ws = null
-    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null }
+  socket.addEventListener('close', (event) => {
+    if (heartbeat) clearInterval(heartbeat)
+    if (ws === socket) ws = null
+    if (opened) {
+      trace('websocket', 'disconnect', {
+        whom: 'easement',
+        where: BROWSER,
+        why: event.reason || `websocket closed with code ${event.code}`,
+        how: 'websocket',
+        code: event.code
+      })
+    }
   })
 
-  ws.addEventListener('error', () => {
-    if (ws) { ws.close(); ws = null }
+  socket.addEventListener('error', () => {
+    socket.close()
   })
 }
 
@@ -273,10 +329,16 @@ async function ensureDebugger (tabId) {
   if (attachedTabs.has(tabId)) return
   await chrome.debugger.attach({ tabId }, '1.3')
   attachedTabs.add(tabId)
+  trace('debugger', 'attach', { how: 'cdp', tab_id: tabId })
 }
 
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId) {
+chrome.debugger.onDetach.addListener((source, reason) => {
+  if (source.tabId != null) {
+    trace('debugger', 'detach', {
+      why: reason || 'Chrome detached the debugger',
+      how: 'cdp',
+      tab_id: source.tabId
+    })
     attachedTabs.delete(source.tabId)
     networkTrackingTabs.delete(source.tabId)
     networkRequestsByTab.delete(source.tabId)
@@ -368,6 +430,8 @@ function handleToolRun (msg) {
   const f = msg.f || ''
   currentSlug = msg.slug || null
 
+  trace('tool', 'run', { call_id: callId, f, slug: currentSlug })
+
   switch (f) {
     case 'screenshot':
       captureScreenshot(callId, msg.tabId)
@@ -391,20 +455,34 @@ function handleToolRun (msg) {
       handleReadNetworkRequests(callId, msg.tabId, msg.urlPattern, msg.clear, msg.limit)
       break
     default:
-      sendToolResponse(callId, 'unknown function: ' + f, 1)
+      sendToolError(callId, 'unknown function: ' + f)
   }
 }
 
 function sendToolResponse (callId, output, exitCode) {
-  wsSend({ what: 'tool', why: 'response', call_id: callId, output, exit_code: exitCode || 0 })
+  const code = exitCode || 0
+  const sent = wsSend({ what: 'tool', why: 'response', call_id: callId, output, exit_code: code })
+  if (sent) {
+    trace('tool', 'respond', { call_id: callId, exit_code: code })
+  } else {
+    trace('tool', 'fail_respond', {
+      why: 'the websocket disconnected before the response was sent',
+      call_id: callId,
+      exit_code: code
+    })
+  }
 }
 
 function sendToolResult (callId, result) {
   const output = JSON.stringify(result)
+  if (result.error) {
+    trace('tool', 'reject', { why: result.error, call_id: callId })
+  }
   sendToolResponse(callId, output, result.error ? 1 : 0)
 }
 
 function sendToolError (callId, message) {
+  trace('tool', 'reject', { why: message, call_id: callId })
   sendToolResponse(callId, message, 1)
 }
 
@@ -808,10 +886,12 @@ async function executeJavascript (callId, code, tabId) {
 // -- Connect on startup --
 //
 // Manifest V3 kills service workers after 30s idle. The alarm wakes us even
-// after Chrome terminates the worker. 15 seconds is frequent enough that tool
-// calls rarely hit a dead worker.
+// after Chrome terminates the worker. Alarm ticks themselves are conditions,
+// not events; they stay silent unless connection state actually changes.
 
 ensureConnection()
 
-chrome.alarms.create('keepalive', { periodInMinutes: 0.25 })
-chrome.alarms.onAlarm.addListener(() => ensureConnection())
+chrome.alarms.create('keepalive', { periodInMinutes: 0.5 })
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'keepalive') ensureConnection()
+})
