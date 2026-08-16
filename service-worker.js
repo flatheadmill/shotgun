@@ -201,18 +201,6 @@ async function navigateTab (tabId, url) {
   }
 }
 
-// -- Side panel and action --
-
-chrome.action.onClicked.addListener(async (tab) => {
-  try {
-    await chrome.sidePanel.open({ tabId: tab.id })
-  } catch (e) {
-    logError('panel', 'fail_open', e, { tab_id: tab.id })
-  }
-})
-
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
-
 // -- WebSocket connection to Easement --
 //
 // On open, register with who=shotgun, where=browser, and declare our tools.
