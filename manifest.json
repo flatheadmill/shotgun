@@ -5,7 +5,6 @@
   "minimum_chrome_version": "116",
   "description": "Claude as a browser companion",
   "permissions": [
-    "sidePanel",
     "debugger",
     "scripting",
     "storage",
@@ -20,12 +19,6 @@
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"
-  },
-  "side_panel": {
-    "default_path": "sidepanel.html"
-  },
-  "action": {
-    "default_title": "Open Shotgun"
   },
   "content_scripts": [{
     "js": ["content/dom-reader.js"],
