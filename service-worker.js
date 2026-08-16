@@ -14,7 +14,7 @@
 // that looked like credentials. We own the pipe. The operator sees
 // the transcript.
 
-import { error as logError, trace } from './log.js'
+import { error as logError, trace, setSink } from './log.js'
 
 const EASEMENT_URL = 'ws://127.0.0.1:6502'
 const BROWSER = 'localhost'
@@ -239,6 +239,11 @@ function wsSend (obj) {
   }
   return false
 }
+
+// Route log records over the same socket. emit sends the log frame through
+// wsSend, which reports whether the socket was open; when it is not, emit
+// falls back to the console until the connection recovers.
+setSink(wsSend)
 
 function ensureConnection () {
   if (ws && ws.readyState === WebSocket.OPEN) return
