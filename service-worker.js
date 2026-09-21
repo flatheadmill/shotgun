@@ -4,11 +4,13 @@
 // time. Easement dispatches tool calls directly to our socket — no
 // broadcast, no claims.
 //
-// Seven tools: screenshot, javascript, tabs_context, tabs_create, navigate,
+// Eight tools: screenshot, screenshot_save, javascript, tabs_context, tabs_create, navigate,
 // read_page, read_network_requests. Tab groups are per-slug, persisted in
 // chrome.storage.local.
 //
-import { error as logError, trace, setSink } from './log.js'
+import { trace, setSink, emit } from './log.js'
+import { ScreenshotSaver } from './screenshot-save.js'
+import { capturePng } from './screenshot-capture.js'
 
 const EASEMENT_URL = 'ws://127.0.0.1:6502'
 const BROWSER = 'localhost'
@@ -33,6 +35,7 @@ const MIN_JPEG_QUALITY = 0.10
 // -- Per-tab state --
 
 const attachedTabs = new Set()
+const pendingDebuggerAttachments = new Map()
 const screenshotContexts = new Map()
 
 // -- Network capture state --
@@ -204,6 +207,7 @@ async function navigateTab (tabId, url) {
 let ws = null
 
 const TOOLS = [
+  { f: 'screenshot_save', description: 'Save an exact PNG through Wicket. Required: action (capture|retry|status), operation_id (caller-known string; use a fresh ID for a deliberate new capture). Capture also requires destination (absolute file path with an existing parent) and mode (viewport|full_page). tabId (int, optional), where (localhost only, optional). Always checks status first. Retry uses only bytes retained in this worker and requires the original destination to retransmit; after worker loss it only reports status. Returns a Wicket outcome as text, without image content.' },
   { f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
   { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
   { f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
@@ -225,6 +229,18 @@ function wsSend (obj) {
 // wsSend, which reports whether the socket was open; when it is not, emit
 // falls back to the console until the connection recovers.
 setSink(wsSend)
+
+const screenshotSaver = new ScreenshotSaver({
+  send: (socket, packet) => {
+    if (socket.readyState !== WebSocket.OPEN) return false
+    // One acknowledged chunk at a time also bounds the browser's socket buffer.
+    if (socket.bufferedAmount > 256 * 1024) return false
+    socket.send(JSON.stringify(packet))
+    return true
+  },
+  capture: args => capturePng(args, { chrome, getContext: getTabContext, ensureDebugger }),
+  observe: emit
+})
 
 function ensureConnection () {
   if (ws && ws.readyState === WebSocket.OPEN) return
@@ -266,19 +282,20 @@ function ensureConnection () {
     let msg
     try {
       msg = JSON.parse(event.data)
-    } catch (e) {
-      logError('wire', 'reject', e, {
-        whom: 'easement',
-        where: BROWSER,
-        how: 'json',
-        raw: event.data
-      })
+    } catch {
+      trace('wire', 'reject', { whom: 'easement', where: BROWSER, how: 'json', why: 'invalid JSON frame' })
+      return
+    }
+
+    // Screenshot-family packets are never passed to a raw-wire logger.
+    if (msg?.what === 'screenshot_save') {
+      screenshotSaver.receive(msg, socket)
       return
     }
 
     // Tool dispatch from Easement. Tagged with what=tool, why=run.
-    if (msg.what === 'tool' && msg.why === 'run') {
-      handleToolRun(msg)
+    if (msg?.what === 'tool' && msg.why === 'run') {
+      handleToolRun(msg, socket)
       return
     }
 
@@ -289,12 +306,12 @@ function ensureConnection () {
       whom: 'easement',
       where: BROWSER,
       why: 'the frame is not a tool dispatch',
-      how: 'websocket',
-      raw: msg
+      how: 'websocket'
     })
   })
 
   socket.addEventListener('close', (event) => {
+    screenshotSaver.disconnect(socket)
     if (heartbeat) clearInterval(heartbeat)
     if (ws === socket) ws = null
     if (opened) {
@@ -321,9 +338,14 @@ function ensureConnection () {
 
 async function ensureDebugger (tabId) {
   if (attachedTabs.has(tabId)) return
-  await chrome.debugger.attach({ tabId }, '1.3')
-  attachedTabs.add(tabId)
-  trace('debugger', 'attach', { how: 'cdp', tab_id: tabId })
+  if (pendingDebuggerAttachments.has(tabId)) return pendingDebuggerAttachments.get(tabId)
+  const pending = (async () => {
+    await chrome.debugger.attach({ tabId }, '1.3')
+    attachedTabs.add(tabId)
+    trace('debugger', 'attach', { how: 'cdp', tab_id: tabId })
+  })()
+  pendingDebuggerAttachments.set(tabId, pending)
+  try { await pending } finally { pendingDebuggerAttachments.delete(tabId) }
 }
 
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -418,7 +440,7 @@ function fitDimensions (w, h, params) {
 
 let currentSlug = null
 
-function handleToolRun (msg) {
+function handleToolRun (msg, socket) {
   const callId = msg.call_id || ''
   const f = msg.f || ''
   currentSlug = msg.slug || null
@@ -426,6 +448,9 @@ function handleToolRun (msg) {
   trace('tool', 'run', { call_id: callId, f, slug: currentSlug })
 
   switch (f) {
+    case 'screenshot_save':
+      handleScreenshotSave(msg, socket)
+      break
     case 'screenshot':
       captureScreenshot(callId, msg.tabId)
       break
@@ -449,6 +474,22 @@ function handleToolRun (msg) {
       break
     default:
       sendToolReject(callId, 'unknown function: ' + f)
+  }
+}
+
+async function handleScreenshotSave (msg, socket) {
+  const result = await screenshotSaver.run(msg, socket)
+  const code = result.why === 'stored' ? 0 : 1
+  // The outer response carries the exact relayed outcome. It never asserts a
+  // separate artifact success, and an old call never replies on a new socket.
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ what: 'tool', why: 'response', call_id: msg.call_id,
+      output: JSON.stringify(result), exit_code: code }))
+    trace('tool', 'respond', { call_id: msg.call_id, exit_code: code,
+      operation_id: msg.operation_id, event_id: result.receipt?.event_id })
+  } else {
+    trace('tool', 'fail_respond', { call_id: msg.call_id, operation_id: msg.operation_id,
+      why: 'the owning socket disconnected; query status by operation_id' })
   }
 }
 
