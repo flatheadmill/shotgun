@@ -4,13 +4,16 @@
 // time. Easement dispatches tool calls directly to our socket — no
 // broadcast, no claims.
 //
-// Eight tools: screenshot, screenshot_save, javascript, tabs_context, tabs_create, navigate,
-// read_page, read_network_requests. Tab groups are per-slug, persisted in
+// Nine tools: screenshot, screenshot_save, javascript, tabs_context, tabs_create, navigate,
+// read_page, firehose, socialite. Tab groups are per-slug, persisted in
 // chrome.storage.local.
 //
 import { trace, setSink, emit } from './log.js'
 import { ScreenshotSaver } from './screenshot-save.js'
 import { capturePng } from './screenshot-capture.js'
+import { Firehose, LIMITS as FIREHOSE_LIMITS } from './firehose.js'
+import { IngressProducer, IngressError, LIMITS as INGRESS_LIMITS, utf8Size } from './companion-ingress.js'
+import { Socialite, LIMITS as SOCIALITE_LIMITS } from './socialite.js'
 
 const EASEMENT_URL = 'ws://127.0.0.1:6502'
 const BROWSER = 'localhost'
@@ -38,49 +41,10 @@ const attachedTabs = new Set()
 const pendingDebuggerAttachments = new Map()
 const screenshotContexts = new Map()
 
-// -- Network capture state --
-//
-// Passive CDP network logging. Network.enable on a tab streams
-// requestWillBeSent / responseReceived events; we keep a per-tab buffer of
-// { requestId, url, method, status }. The buffer resets when the tab navigates
-// to a new domain and is capped so a long-lived tab cannot grow without bound.
-// This is the substrate the extendable observers will pull from; for now it
-// backs the read_network_requests tool.
-//
-// Tracking is enabled lazily on the first read for a tab and left on — the same
-// attach-once philosophy as ensureDebugger. Network tracking remains enabled
-// between reads because the buffer is owned here, and cycling it would drop
-// events arriving during the transition.
-const networkRequestsByTab = new Map()
-const networkTrackingTabs = new Set()
-const MAX_NETWORK_REQUESTS_PER_TAB = 1000
-
-function extractDomain (url) {
-  try {
-    return new URL(url).hostname
-  } catch {
-    return ''
-  }
-}
-
-function addNetworkRequest (tabId, domain, record) {
-  let entry = networkRequestsByTab.get(tabId)
-  if (entry) {
-    // A domain change means a new page; the prior page's requests are no longer
-    // what a caller is asking about, so drop them.
-    if (entry.domain !== domain) {
-      entry.domain = domain
-      entry.requests = []
-    }
-  } else {
-    entry = { domain, requests: [] }
-    networkRequestsByTab.set(tabId, entry)
-  }
-  entry.requests.push(record)
-  if (entry.requests.length > MAX_NETWORK_REQUESTS_PER_TAB) {
-    entry.requests.splice(0, entry.requests.length - MAX_NETWORK_REQUESTS_PER_TAB)
-  }
-}
+const firehose = new Firehose({
+  attach: ensureDebugger,
+  command: (tabId, method, params) => chrome.debugger.sendCommand({ tabId }, method, params)
+})
 
 function utf8ToBase64 (str) {
   // btoa chokes on non-Latin1. Page content has unicode.
@@ -214,7 +178,8 @@ const TOOLS = [
   { f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
   { f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
   { f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional), frameId (int, optional, default 0 for top frame).' },
-  { f: 'read_network_requests', description: 'Read HTTP requests (XHR, fetch, documents, images) captured from a tab via passive CDP network logging. Tracking starts on the first call for a tab; the buffer clears when the tab navigates to a new domain. Args: tabId (int, optional), urlPattern (string, optional — only requests whose URL contains it), clear (bool, optional — clear after reading to avoid duplicates), limit (int, optional, default 100).' },
+  { f: 'firehose', description: 'Temporary passive Network tap with one in-memory pile. action=start requires an explicit tabId (positive int), with optional url (absolute URL literal without query or fragment) selecting response bodies; all request metadata is observed. Start after stop replaces the pile. action=read inspects from (int, default 0) and limit (1-100, default 50), or body (one body-outcome pile index). Reading never starts capture or fetches a body. action=stop freezes the pile and disables Network reporting without detaching the debugger. One body command, no queue; busy, unavailable, clipping and full are explicit. Fixed limits are reported; worker loss loses the pile. No persistence or application parsing.' },
+  { f: 'socialite', description: 'Passive X Bookmarks review to the standing Socialite companion. action=start requires an explicit positive tabId on https://x.com and one available companion. action=status reports limits, acquisition and retained-operation state without source content. action=stop closes acquisition while retained transfers resolve. action=lookup requires operation_id retained in this worker and only queries its receipt. action=abandon requires operation_id and explicitly discards its cargo, retaining the full manifest in a bounded in-memory tombstone for later lookup; remote acceptance remains unknown. Unresolved retained cargo blocks a later review. Mutually exclusive with Firehose Network capture. No scrolling, synthetic requests, reconnect retry, persistence or video capture.' },
 ]
 
 function wsSend (obj) {
@@ -240,6 +205,22 @@ const screenshotSaver = new ScreenshotSaver({
   },
   capture: args => capturePng(args, { chrome, getContext: getTabContext, ensureDebugger }),
   observe: emit
+})
+
+const socialiteIngress = new IngressProducer({
+  send: (socket, packet) => {
+    const text = JSON.stringify(packet)
+    if (socket !== ws || socket?.readyState !== WebSocket.OPEN || utf8Size(text) > INGRESS_LIMITS.packetBytes ||
+      socket.bufferedAmount + utf8Size(text) > INGRESS_LIMITS.socketBufferedBytes) return false
+    socket.send(text)
+    return true
+  }
+})
+const socialite = new Socialite({
+  ingress: socialiteIngress, attach: ensureDebugger,
+  command: (tabId, method, params) => chrome.debugger.sendCommand({ tabId }, method, params),
+  getTab: tabId => chrome.tabs.get(tabId), socket: () => ws,
+  firehoseBusy: () => Boolean(firehose.transition) || firehose.current?.state === 'collecting'
 })
 
 function ensureConnection () {
@@ -292,6 +273,10 @@ function ensureConnection () {
       screenshotSaver.receive(msg, socket)
       return
     }
+    if (msg?.what === 'companion_ingress') {
+      socialiteIngress.receive(msg, socket)
+      return
+    }
 
     // Tool dispatch from Easement. Tagged with what=tool, why=run.
     if (msg?.what === 'tool' && msg.why === 'run') {
@@ -312,13 +297,14 @@ function ensureConnection () {
 
   socket.addEventListener('close', (event) => {
     screenshotSaver.disconnect(socket)
+    socialite.disconnect(socket)
     if (heartbeat) clearInterval(heartbeat)
     if (ws === socket) ws = null
     if (opened) {
       trace('websocket', 'disconnect', {
         whom: 'easement',
         where: BROWSER,
-        why: event.reason || `websocket closed with code ${event.code}`,
+        why: `websocket closed with code ${event.code}`,
         how: 'websocket',
         code: event.code
       })
@@ -341,11 +327,14 @@ async function ensureDebugger (tabId) {
   if (pendingDebuggerAttachments.has(tabId)) return pendingDebuggerAttachments.get(tabId)
   const pending = (async () => {
     await chrome.debugger.attach({ tabId }, '1.3')
+    if (pendingDebuggerAttachments.get(tabId) !== pending) throw new Error('Debugger attachment ended before completing')
     attachedTabs.add(tabId)
     trace('debugger', 'attach', { how: 'cdp', tab_id: tabId })
   })()
   pendingDebuggerAttachments.set(tabId, pending)
-  try { await pending } finally { pendingDebuggerAttachments.delete(tabId) }
+  try { await pending } finally {
+    if (pendingDebuggerAttachments.get(tabId) === pending) pendingDebuggerAttachments.delete(tabId)
+  }
 }
 
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -356,47 +345,30 @@ chrome.debugger.onDetach.addListener((source, reason) => {
       tab_id: source.tabId
     })
     attachedTabs.delete(source.tabId)
-    networkTrackingTabs.delete(source.tabId)
-    networkRequestsByTab.delete(source.tabId)
+    pendingDebuggerAttachments.delete(source.tabId)
+    firehose.detached(source.tabId)
+    socialite.detached(source.tabId)
   }
 })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId)
   screenshotContexts.delete(tabId)
-  networkTrackingTabs.delete(tabId)
-  networkRequestsByTab.delete(tabId)
+  pendingDebuggerAttachments.delete(tabId)
+  firehose.detached(tabId, 'tab_removed')
+  socialite.detached(tabId, 'tab_removed')
 })
+chrome.tabs.onUpdated.addListener((tabId, change) => socialite.navigation(tabId, change.url))
 
 // -- Network event capture --
-//
-// One listener serves every attached tab. requestWillBeSent opens a record
-// keyed by the page's domain; responseReceived and loadingFailed fill in the
-// status. The domain comes from documentURL when present so subframe requests
-// still attribute to the page, falling back to the request URL.
+// The two explicit consumers exclude one another while owning Network capture.
+// No child-session attachment is requested; body commands address the tab session.
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  const tabId = source.tabId
-  if (!tabId) return
-  if (method === 'Network.requestWillBeSent') {
-    const record = { requestId: params.requestId, url: params.request.url, method: params.request.method }
-    addNetworkRequest(tabId, extractDomain(params.documentURL || params.request.url), record)
-  } else if (method === 'Network.responseReceived') {
-    const entry = networkRequestsByTab.get(tabId)
-    const req = entry && entry.requests.find(r => r.requestId === params.requestId)
-    if (req) req.status = params.response.status
-  } else if (method === 'Network.loadingFailed') {
-    const entry = networkRequestsByTab.get(tabId)
-    const req = entry && entry.requests.find(r => r.requestId === params.requestId)
-    if (req) req.status = 503
+  if (!source.sessionId) {
+    firehose.onEvent(source.tabId, method, params)
+    socialite.onEvent(source.tabId, method, params)
   }
 })
-
-async function enableNetworkTracking (tabId) {
-  await ensureDebugger(tabId)
-  if (networkTrackingTabs.has(tabId)) return
-  await chrome.debugger.sendCommand({ tabId }, 'Network.enable', { maxPostDataSize: 65536 })
-  networkTrackingTabs.add(tabId)
-}
 
 // -- Token budget resize --
 //
@@ -469,8 +441,11 @@ function handleToolRun (msg, socket) {
     case 'read_page':
       handleReadPage(callId, msg.selector, msg.maxChars, msg.tabId, msg.frameId)
       break
-    case 'read_network_requests':
-      handleReadNetworkRequests(callId, msg.tabId, msg.urlPattern, msg.clear, msg.limit)
+    case 'firehose':
+      handleFirehose(msg, socket)
+      break
+    case 'socialite':
+      handleSocialite(msg, socket)
       break
     default:
       sendToolReject(callId, 'unknown function: ' + f)
@@ -588,58 +563,59 @@ async function handleReadPage (callId, selector, maxChars, tabId, frameId) {
   }
 }
 
-// -- Network requests (passive CDP capture) --
-//
-// Enable tracking on the tab if it is not already on, read the accumulated
-// buffer, optionally filter by URL substring, optionally clear to avoid
-// duplicates on the next call. No JavaScript injection, no DOM — the only
-// page-side trace is the debugger bar any CDP tool already raises.
-async function handleReadNetworkRequests (callId, tabId, urlPattern, clear, limit) {
+// -- Firehose (explicit, disposable Network tap) --
+async function handleFirehose (msg, socket) {
+  const { call_id: callId, slug, action, tabId, url, from, limit, body } = msg
+  let result; let exitCode = 0
   try {
-    const resolvedTabId = await resolveTabId(tabId)
-    if (!resolvedTabId) {
-      sendToolReject(callId, 'No tab found')
-      return
+    if (action === 'start') {
+      if (socialite.ownsNetwork) throw new Error('Socialite owns Network capture; stop it before starting Firehose')
+      result = await firehose.start({ tabId, url })
     }
-    await enableNetworkTracking(resolvedTabId)
-
-    const entry = networkRequestsByTab.get(resolvedTabId)
-    let requests = entry ? entry.requests : []
-    if (urlPattern) requests = requests.filter(r => r.url.includes(urlPattern))
-
-    const max = limit || 100
-    const tabContext = await getTabContext(currentSlug)
-
-    if (requests.length === 0) {
-      if (clear) networkRequestsByTab.delete(resolvedTabId)
-      const what = urlPattern ? `requests matching "${urlPattern}"` : 'network requests'
-      sendToolResult(callId, {
-        output: `No ${what} found for tab ${resolvedTabId}.\n\nTracking starts when this tool is first called for a tab. If the page loaded before that, reload it or take an action that triggers requests, then read again.`,
-        requests: [],
-        tabContext
-      })
-      return
-    }
-
-    const shown = requests.slice(0, max)
-    const truncated = requests.length > max
-    if (clear) networkRequestsByTab.delete(resolvedTabId)
-
-    const lines = shown
-      .map((r, i) => `${i + 1}. url: ${r.url}\n   method: ${r.method}\n   statusCode: ${r.status || 'pending'}`)
-      .join('\n\n')
-    const filterNote = urlPattern ? ` (filtered by URL pattern "${urlPattern}")` : ''
-    const truncNote = truncated ? ` (showing first ${max} of ${requests.length})` : ''
-    const header = `Found ${requests.length} network request${requests.length === 1 ? '' : 's'}${filterNote}${truncNote}:`
-
-    sendToolResult(callId, {
-      output: `${header}\n\n${lines}`,
-      requests: shown,
-      tabContext
-    })
+    else if (action === 'read') result = firehose.read({ from, limit, body })
+    else if (action === 'stop') result = firehose.stop()
+    else throw new Error('firehose action must be start, read or stop')
   } catch (e) {
-    sendToolFailure(callId, e.message || 'read_network_requests failed')
+    result = { error: String(e?.message ?? e).slice(0, 1024) }
+    exitCode = 1
   }
+  let output = JSON.stringify(result)
+  if (new TextEncoder().encode(output).length > FIREHOSE_LIMITS.readBytes) {
+    output = JSON.stringify({ error: 'Firehose result exceeds its serialized read limit' })
+    exitCode = 1
+  }
+  // Never log capture contents or returned CDP errors. A reply belongs to this
+  // dispatch's socket even if a replacement connection is now open.
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ what: 'tool', why: 'response', call_id: callId, output, exit_code: exitCode }))
+    trace('tool', 'respond', { call_id: callId, slug, exit_code: exitCode })
+  } else {
+    trace('tool', 'fail_respond', { call_id: callId, slug, why: 'the owning socket disconnected' })
+  }
+}
+
+async function handleSocialite (msg, socket) {
+  const { call_id: callId, slug, action, tabId, operation_id: operation } = msg
+  let result; let exitCode = 0
+  try {
+    if (socket !== ws || socket.readyState !== WebSocket.OPEN) throw new IngressError('connection_unavailable')
+    if (action === 'start') result = await socialite.start({ tabId }, socket)
+    else if (action === 'status') result = socialite.status()
+    else if (action === 'stop') result = socialite.stop()
+    else if (action === 'lookup') result = await socialiteIngress.lookup(operation, socket)
+    else if (action === 'abandon') result = socialiteIngress.abandon(operation)
+    else throw new IngressError('invalid_action')
+  } catch (error) {
+    result = { error: error instanceof IngressError ? error.code : 'socialite_failed' }; exitCode = 1
+  }
+  let output = JSON.stringify(result)
+  if (utf8Size(output) > SOCIALITE_LIMITS.statusBytes) { output = JSON.stringify({ error: 'status_limit' }); exitCode = 1 }
+  // Status and failures are bounded dispositions, never CDP or peer error text.
+  // A delayed tool response still belongs only to its original physical socket.
+  if (socket === ws && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ what: 'tool', why: 'response', call_id: callId, output, exit_code: exitCode }))
+    trace('tool', 'respond', { call_id: callId, slug, exit_code: exitCode })
+  } else trace('tool', 'fail_respond', { call_id: callId, slug, why: 'the owning socket disconnected' })
 }
 
 // -- Screenshot capture --

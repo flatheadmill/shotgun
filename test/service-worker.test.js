@@ -44,7 +44,7 @@ test('actual worker registers save, routes quiet status, and preserves JPEG scre
     socket.listeners.open()
     const registered = frames.find(f => f.what === 'socket' && f.why === 'connect')
     assert.ok(registered.tools.some(t => t.f === 'screenshot_save'))
-    assert.equal(registered.tools.length, 8)
+    assert.equal(registered.tools.length, 9)
     socket.receive({ ...call({ action: 'status' }), what: 'tool', why: 'run', f: 'screenshot_save' })
     await tick()
     const query = frames.find(f => f.what === 'screenshot_save' && f.why === 'status')
