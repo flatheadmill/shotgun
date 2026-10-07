@@ -107,7 +107,7 @@ test('actual Socialite dispatch probes before acquisition and excludes Firehose 
   const socket = f.sockets[0]
   try {
     const registration = socket.frames.find(p => p.what === 'socket' && p.why === 'connect')
-    assert.equal(registration.tools.length, 9); assert.ok(registration.tools.some(t => t.f === 'socialite'))
+    assert.equal(registration.tools.length, 10); assert.ok(registration.tools.some(t => t.f === 'socialite'))
     assert.equal((await invoke(socket, 'no-tab', { action: 'start' })).error, 'explicit_tab_required')
     f.url('https://example.test/')
     assert.equal((await invoke(socket, 'wrong-tab', { action: 'start', tabId: 7 })).error, 'explicit_x_tab_required')

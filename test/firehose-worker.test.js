@@ -92,7 +92,7 @@ test('actual Firehose dispatch keeps local replies, quiet capture, and shared sc
   const first = sockets[0]
   try {
     const registration = first.frames.find(f => f.what === 'socket' && f.why === 'connect')
-    assert.equal(registration.tools.length, 9)
+    assert.equal(registration.tools.length, 10)
     assert.ok(registration.tools.some(t => t.f === 'firehose'))
     assert.equal(registration.tools.some(t => t.f === 'read_network_requests'), false)
     call(first, 'unarmed', { action: 'read' })

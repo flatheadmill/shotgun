@@ -4,8 +4,9 @@
 // time. Easement dispatches tool calls directly to our socket — no
 // broadcast, no claims.
 //
-// Nine tools: screenshot, screenshot_save, javascript, tabs_context, tabs_create, navigate,
-// read_page, firehose, socialite. Tab groups are per-slug, persisted in
+// Ten tools: screenshot, screenshot_save, javascript, tabs_context,
+// tabs_create, tabs_close, navigate, read_page, firehose, socialite. Tab groups
+// are per-slug, persisted in
 // chrome.storage.local.
 //
 import { trace, setSink, emit } from './log.js'
@@ -176,6 +177,7 @@ const TOOLS = [
   { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
   { f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
   { f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
+  { f: 'tabs_close', description: 'Close a browser tab. Args: tabId (positive safe integer, required).' },
   { f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
   { f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional), frameId (int, optional, default 0 for top frame).' },
   { f: 'firehose', description: 'Temporary passive Network tap with one in-memory pile. action=start requires an explicit tabId (positive int), with optional url (absolute URL literal without query or fragment) selecting response bodies; all request metadata is observed. Start after stop replaces the pile. action=read inspects from (int, default 0) and limit (1-100, default 50), or body (one body-outcome pile index). Reading never starts capture or fetches a body. action=stop freezes the pile and disables Network reporting without detaching the debugger. One body command, no queue; busy, unavailable, clipping and full are explicit. Fixed limits are reported; worker loss loses the pile. No persistence or application parsing.' },
@@ -435,6 +437,9 @@ function handleToolRun (msg, socket) {
     case 'tabs_create':
       handleTabsCreate(callId, currentSlug, msg.url)
       break
+    case 'tabs_close':
+      handleTabsClose(callId, msg.tabId)
+      break
     case 'navigate':
       handleNavigate(callId, msg.tabId, msg.url)
       break
@@ -517,6 +522,19 @@ async function handleTabsCreate (callId, slug, url) {
     sendToolResult(callId, result)
   } catch (e) {
     sendToolFailure(callId, e.message || 'tabs_create failed')
+  }
+}
+
+async function handleTabsClose (callId, tabId) {
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
+    sendToolReject(callId, 'tabId is required and must be a positive safe integer')
+    return
+  }
+  try {
+    await chrome.tabs.remove(tabId)
+    sendToolResponse(callId, `Closed tab ${tabId}`, 0)
+  } catch (e) {
+    sendToolFailure(callId, e.message || 'tabs_close failed')
   }
 }
 

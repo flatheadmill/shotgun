@@ -6,11 +6,11 @@ import { png, call, reply, tick } from './fixture.js'
 
 // Load the actual worker with browser boundary doubles. This is not a claim
 // that Chrome or a display was exercised; loaded-extension checks are separate.
-test('actual worker registers save, routes quiet status, and preserves JPEG screenshot content', async () => {
+test('actual worker closes explicit tabs, routes quiet save status, and preserves JPEG screenshot content', async () => {
   const previous = Object.fromEntries(['chrome', 'WebSocket', 'setInterval', 'clearInterval', 'createImageBitmap'].map(k => [k, globalThis[k]]))
   const originalLog = console.log
   const output = []; console.log = value => output.push(value)
-  const frames = []; const commands = []; let captures = 0
+  const frames = []; const commands = []; const removals = []; let captures = 0
   const event = { addListener () {} }
   let socket
   let holdAttach = false
@@ -29,7 +29,13 @@ test('actual worker registers save, routes quiet status, and preserves JPEG scre
   globalThis.chrome = {
     storage: { local: { get: async () => ({}) } }, tabGroups: {},
     alarms: { create () {}, onAlarm: event },
-    tabs: { onRemoved: event, onUpdated: event, query: async () => [{ id: 7 }], get: async () => ({ url: 'https://example.test/', title: 'Fixture' }) },
+    tabs: {
+      onRemoved: event, onUpdated: event, query: async () => [{ id: 7 }], get: async () => ({ url: 'https://example.test/', title: 'Fixture' }),
+      remove: async tabId => {
+        removals.push(tabId)
+        if (tabId === 9) throw new Error('No tab with id: 9')
+      }
+    },
     debugger: { onDetach: event, onEvent: event, attach: async () => { if (holdAttach) await new Promise(resolve => pendingAttaches.push(resolve)) }, sendCommand: async (target, command, params) => {
       commands.push({ target, command, params })
       if (command === 'Page.getLayoutMetrics') return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 }, cssContentSize: { x: 0, y: 0, width: 800, height: 2400 } }
@@ -44,7 +50,29 @@ test('actual worker registers save, routes quiet status, and preserves JPEG scre
     socket.listeners.open()
     const registered = frames.find(f => f.what === 'socket' && f.why === 'connect')
     assert.ok(registered.tools.some(t => t.f === 'screenshot_save'))
-    assert.equal(registered.tools.length, 9)
+    assert.ok(registered.tools.some(t => t.f === 'tabs_close'))
+    assert.equal(registered.tools.length, 10)
+    socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id: 'close-success', slug: 'easement', tabId: 12 })
+    await tick()
+    assert.deepEqual(removals, [12])
+    assert.deepEqual(frames.find(f => f.what === 'tool' && f.call_id === 'close-success'), {
+      what: 'tool', why: 'response', call_id: 'close-success', output: 'Closed tab 12', exit_code: 0
+    })
+    for (const [n, tabId] of [undefined, null, 0, -1, 1.5, '7', true, [], [7], {}, Number.MAX_SAFE_INTEGER + 1].entries()) {
+      const call_id = `close-invalid-${n}`
+      socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id, slug: 'easement', tabId })
+      await tick()
+      const response = frames.find(f => f.what === 'tool' && f.call_id === call_id)
+      assert.equal(response.exit_code, 1)
+      assert.match(response.output, /tabId.*positive safe integer/)
+      assert.deepEqual(removals, [12], 'invalid IDs must not call chrome.tabs.remove')
+    }
+    socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id: 'close-failure', slug: 'easement', tabId: 9 })
+    await tick()
+    assert.deepEqual(removals, [12, 9])
+    const closeFailure = frames.find(f => f.what === 'tool' && f.call_id === 'close-failure')
+    assert.equal(closeFailure.exit_code, 1)
+    assert.equal(closeFailure.output, 'No tab with id: 9')
     socket.receive({ ...call({ action: 'status' }), what: 'tool', why: 'run', f: 'screenshot_save' })
     await tick()
     const query = frames.find(f => f.what === 'screenshot_save' && f.why === 'status')
