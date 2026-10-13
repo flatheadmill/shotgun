@@ -6,8 +6,7 @@
 //
 // Ten tools: screenshot, screenshot_save, javascript, tabs_context,
 // tabs_create, tabs_close, navigate, read_page, firehose, socialite. Tab groups
-// are per-slug, persisted in
-// chrome.storage.local.
+// use the slug plus reserved yellow color as ownership; stored IDs are caches.
 //
 import { trace, setSink, emit } from './log.js'
 import { ScreenshotSaver } from './screenshot-save.js'
@@ -57,71 +56,97 @@ function utf8ToBase64 (str) {
 
 // -- Tab group management (per slug) --
 //
-// Tab groups survive across context windows — they belong to the collaboration
-// (slug), not the session (timestamp). Chrome deletes the group when the last
-// tab in it closes. We persist the group ID in chrome.storage.local and
-// validate it on each use because Chrome may have cleaned it up behind our
-// back.
+// The slug survives restarts; Chrome's numeric group IDs are session-scoped.
+// Shotgun reserves yellow: both exact slug title and color establish ownership.
+// Validate cached IDs and recovery candidates against both; another color is
+// not a cosmetic defect to repair, even when the title matches.
+// Moving the last tab out also destroys a group, so merge by tab IDs and keep
+// the canonical group's original tabs in place while moving the others.
 
-const tabGroups = {}
+const tabGroups = new Map()
+const tabGroupTasks = new Map()
 
+function ownsTabGroup (slug, group) {
+  return group?.title === slug && group?.color === GROUP_COLOR
+}
+
+async function withTabGroup (slug, work) {
+  const previous = tabGroupTasks.get(slug) || Promise.resolve()
+  const current = previous.catch(() => {}).then(work)
+  tabGroupTasks.set(slug, current)
+  try { return await current } finally {
+    if (tabGroupTasks.get(slug) === current) tabGroupTasks.delete(slug)
+  }
+}
+
+// Internal helpers run under withTabGroup, including creation and persistence.
 async function loadTabGroupForSlug (slug) {
   if (!slug) return null
-  if (tabGroups[slug]) return tabGroups[slug]
   const key = STORAGE_KEY_PREFIX + slug
-  const data = await chrome.storage.local.get(key)
-  const id = data[key]
-  if (id == null) return null
-  try {
-    await chrome.tabGroups.get(id)
-    tabGroups[slug] = id
-    return id
-  } catch {
+  const id = tabGroups.get(slug) ?? (await chrome.storage.local.get(key))[key]
+  if (id != null) {
+    let group
+    if (Number.isSafeInteger(id) && id >= 0) {
+      try { group = await chrome.tabGroups.get(id) } catch { /* Fall back to a current title lookup. */ }
+    }
+    if (ownsTabGroup(slug, group)) {
+      tabGroups.set(slug, id)
+      return id
+    }
     trace('tabs', 'forget_group', {
-      why: 'the stored tab group no longer exists',
+      why: 'the cached tab group could not be validated against the slug and reserved color',
       slug,
       group_id: id
     })
+    tabGroups.delete(slug)
     await chrome.storage.local.remove(key)
-    return null
   }
+
+  // Chrome's title query is pattern-based; enforce exact title and color here.
+  const groups = (await chrome.tabGroups.query({}))
+    .filter(group => ownsTabGroup(slug, group)).sort((a, b) => a.id - b.id)
+  if (groups.length === 0) return null
+  const canonical = groups[0]
+  let groupId = canonical.id
+  // Chrome mutations are not transactional. Propagate errors instead of
+  // claiming consolidation succeeded; never close tabs to roll back a move.
+  for (const duplicate of groups.slice(1)) {
+    const tabs = (await chrome.tabs.query({ groupId: duplicate.id })).sort((a, b) => a.index - b.index)
+    const tabIds = tabs.map(tab => tab.id)
+    if (tabIds.length === 0) continue
+    const source = await getOwnedTabGroup(slug, duplicate.id)
+    const target = await getOwnedTabGroup(slug, groupId)
+    if (source.windowId !== target.windowId) {
+      await chrome.tabs.move(tabIds, { windowId: target.windowId, index: -1 })
+      await getOwnedTabGroup(slug, groupId)
+    }
+    // The duplicate ID may no longer exist after move. Do not query or update
+    // it again; use the retained tab IDs and the group returned by Chrome.
+    groupId = await chrome.tabs.group({ tabIds, groupId })
+  }
+  await getOwnedTabGroup(slug, groupId)
+  await saveTabGroupForSlug(slug, groupId)
+  return groupId
 }
 
 async function saveTabGroupForSlug (slug, groupId) {
-  tabGroups[slug] = groupId
   const key = STORAGE_KEY_PREFIX + slug
   await chrome.storage.local.set({ [key]: groupId })
+  tabGroups.set(slug, groupId)
 }
 
-async function ensureGroupCharacteristics (slug, groupId) {
-  try {
-    const group = await chrome.tabGroups.get(groupId)
-    if (group.title !== slug || group.color !== GROUP_COLOR) {
-      await chrome.tabGroups.update(groupId, { title: slug, color: GROUP_COLOR })
-    }
-  } catch (e) {
-    // Best effort. The group is cosmetic, and it may have been closed between
-    // the lookup and the update; there is nothing to repair if it is gone.
-  }
+async function getOwnedTabGroup (slug, groupId) {
+  const group = await chrome.tabGroups.get(groupId)
+  if (!ownsTabGroup(slug, group)) throw new Error('Tab group ownership changed; expected the exact slug title and yellow color')
+  return group
 }
 
-async function getTabContext (slug) {
-  const groupId = await loadTabGroupForSlug(slug)
-  if (!groupId) {
-    return { currentTabId: null, availableTabs: [], tabCount: 0, tabGroupId: null }
-  }
-  try {
-    await chrome.tabGroups.get(groupId)
-    await ensureGroupCharacteristics(slug, groupId)
-  } catch {
-    trace('tabs', 'forget_group', {
-      why: 'the tab group vanished after validation',
-      slug,
-      group_id: groupId
-    })
-    delete tabGroups[slug]
-    const key = STORAGE_KEY_PREFIX + slug
-    await chrome.storage.local.remove(key)
+function getTabContext (slug) {
+  return withTabGroup(slug, async () => tabContextForGroup(await loadTabGroupForSlug(slug)))
+}
+
+async function tabContextForGroup (groupId) {
+  if (groupId == null) {
     return { currentTabId: null, availableTabs: [], tabCount: 0, tabGroupId: null }
   }
   const tabs = (await chrome.tabs.query({ groupId }))
@@ -135,22 +160,26 @@ async function getTabContext (slug) {
   }
 }
 
-async function createTabInGroup (slug, url) {
-  const tab = await chrome.tabs.create({ url: url || 'chrome://newtab', active: true })
-  if (!tab.id) return { error: 'Failed to create tab.' }
-  let groupId = await loadTabGroupForSlug(slug)
-  if (!groupId) {
-    groupId = await chrome.tabs.group({ tabIds: [tab.id] })
-    await chrome.tabGroups.update(groupId, { title: slug, color: GROUP_COLOR, collapsed: false })
-    await saveTabGroupForSlug(slug, groupId)
-  } else {
-    await chrome.tabs.group({ tabIds: tab.id, groupId })
-  }
-  const context = await getTabContext(slug)
-  return {
-    output: `Created tab ${tab.id}${url ? ' at ' + url : ''}`,
-    tabContext: context
-  }
+function createTabInGroup (slug, url) {
+  return withTabGroup(slug, async () => {
+    let groupId = await loadTabGroupForSlug(slug)
+    const group = groupId == null ? null : await getOwnedTabGroup(slug, groupId)
+    const tab = await chrome.tabs.create({ url: url || 'chrome://newtab', active: true,
+      ...(group ? { windowId: group.windowId } : {}) })
+    if (!tab.id) return { error: 'Failed to create tab.' }
+    if (groupId == null) {
+      groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } })
+      await chrome.tabGroups.update(groupId, { title: slug, color: GROUP_COLOR, collapsed: false })
+      await saveTabGroupForSlug(slug, groupId)
+    } else {
+      await getOwnedTabGroup(slug, groupId)
+      groupId = await chrome.tabs.group({ tabIds: tab.id, groupId })
+    }
+    return {
+      output: `Created tab ${tab.id}${url ? ' at ' + url : ''}`,
+      tabContext: await tabContextForGroup(groupId)
+    }
+  })
 }
 
 async function navigateTab (tabId, url) {
