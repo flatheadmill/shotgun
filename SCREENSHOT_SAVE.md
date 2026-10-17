@@ -14,6 +14,9 @@ Every call requires `operation_id` and `action`:
   service-worker lifetime. Retransmission requires the original `destination`
   in the tool arguments. It never captures again.
 - `status`: query the operation; never capture or retransmit.
+- `abandon`: query status, then explicitly discard any PNG retained by this
+  worker. An unknown remote operation becomes `abandoned`; a receiving remote
+  operation is cancelled through Wicket and returns that authoritative outcome.
 
 `tabId` is optional and explicit when supplied. Otherwise, selection uses this
 call's slug group, followed by the existing active-tab fallback. Concurrent calls
@@ -33,14 +36,17 @@ All actions query status first. An existing terminal outcome returns its
 immutable receipt. `capture` proceeds only from `unknown` and only if this
 worker does not already hold that operation. After a worker restart, `retry`
 without bytes returns `unknown` or `receiving` as observed, without recapture or
-cancellation. `unknown` is not proof that this ID was never used: pre-acceptance
-state can disappear. Choosing a fresh ID for `capture` is a caller obligation.
+cancellation. `abandon` is the deliberate escape from retained-operation and
+byte capacity; nothing is silently evicted. `unknown` is not proof that this ID
+was never used: pre-acceptance state can disappear. Choosing a fresh ID for
+`capture` is a caller obligation.
 
 The result is the exact relayed Wicket/Easement packet serialized as ordinary
 tool text. It has the current call/operation/attempt identity; a recovered
-receipt keeps its original attempt and event identity. Only `stored` uses exit
-code zero. Easement's existing MCP text wrapper appends `[exit code: 1]` to
-nonzero outcomes, including nonterminal status observations.
+receipt keeps its original attempt and event identity. `stored`, and a completed
+explicit abandonment (`abandoned` or `aborted`), use exit code zero. Easement's
+existing MCP text wrapper appends `[exit code: 1]` to other outcomes, including
+nonterminal status observations.
 
 ## Capture and memory
 
@@ -58,7 +64,7 @@ CDP returns the complete base64 PNG in memory. Shotgun bounds encoded length
 before decoding, checks canonical base64, PNG framing and CRCs, dimensions and
 SHA-256, then uses a temporary bitmap to verify decoding without re-encoding.
 Wicket independently checks the complete PNG again before acceptance. These
-limits apply: 32 MiB PNG, 32,768 per dimension, 32 million pixels (32 * 1024 *
+limits apply: 32 MiB PNG, 32,768 per dimension, 64 million pixels (64 * 1024 *
 1024), four active calls/retained operations, and 64 MiB reserved capture/retained
 PNG bytes. Each pending capture reserves the full 32 MiB until it settles.
 Base64 strings and browser decoder allocations add overhead to those PNG-byte
@@ -66,7 +72,9 @@ budgets; the budgets do not describe total process RSS.
 
 Bytes live only in service-worker memory. There is no IndexedDB spool, new
 permission, or `unlimitedStorage`. Unresolved bytes are retained and are not
-silently evicted to admit another capture. Terminal receipts release bytes.
+silently evicted to admit another capture. Terminal receipts and explicit
+abandonment release bytes. A capacity refusal is routed as `rejected` rather
+than being masked by the preceding status observation.
 Chrome has no capture-cancel primitive: when a route is lost, its call can end
 promptly but a still-running capture keeps its reservation until it settles.
 A settled capture may then support an explicit same-worker retry. A capture

@@ -49,7 +49,7 @@ test('reject malformed, trailing, corrupted, animated and oversized PNG without 
     png(1, 1, LIMITS.pngBytes).toString('base64'), png(1, 1, 0, { animated: true }).toString('base64')]) {
     await assert.rejects(decodePng(input), e => !e.message.includes('RAW_SCREENSHOT_SENTINEL'))
   }
-  for (const shape of [{ width: LIMITS.dimension + 1 }, { width: 8192, height: 8192 }, { width: 0 }]) {
+  for (const shape of [{ width: LIMITS.dimension + 1 }, { width: 8193, height: 8192 }, { width: 0 }]) {
     await assert.rejects(decodePng(png(1, 1, 0, shape).toString('base64')), /dimensions exceed limits/)
   }
 })
@@ -66,6 +66,15 @@ test('capture plans never resize, change quality, scroll or guess a DPR multipli
   assert.deepEqual(capturePlan('viewport', metrics, 2), { format: 'png', fromSurface: true, captureBeyondViewport: false })
   assert.deepEqual(capturePlan('full_page', metrics, 2), { format: 'png', fromSurface: true, captureBeyondViewport: true, clip: { x: 0, y: 0, width: 800, height: 2400, scale: 1 } })
   assert.throws(() => capturePlan('full_page', { ...metrics, cssContentSize: { width: 32768, height: 32768 } }, 2))
+})
+test('full-page preflight admits the observed narrow wrapper within the bounded decode budget', () => {
+  const metrics = {
+    cssVisualViewport: { clientWidth: 1435, clientHeight: 947, zoom: 0.5 },
+    cssContentSize: { x: 0, y: 0, width: 1420, height: 7400 }
+  }
+  assert.deepEqual(capturePlan('full_page', metrics, 2).clip,
+    { x: 0, y: 0, width: 710, height: 3700, scale: 1 })
+  assert.ok(2840 * 14800 < LIMITS.pixels)
 })
 test('50% browser zoom on Retina fills the full-page canvas at effective DPR 1', () => {
   // Recorded Chrome 153 fixture: CSS content 2946x2552, browser zoom .5,
@@ -190,6 +199,33 @@ test('conflicting intent cannot replace retained bytes', async () => {
   await awaiting(h, 'status'); h.answer('unknown')
   assert.equal((await second).why, 'rejected'); assert.equal(h.captures(), 1)
 })
+test('explicit abandon releases retained bytes and reconciles the remote receive', async () => {
+  const h = harness(); const capture = h.saver.run(call(), h.socket)
+  await awaiting(h, 'status'); h.answer('unknown'); await awaiting(h, 'begin')
+  h.saver.disconnect(h.socket); assert.equal((await capture).why, 'unresolved')
+  assert.ok(h.saver.retainedBytes > 0)
+  const intent = h.saver.operations.get('easement\0op-1').intent
+  const abandon = h.saver.run(call({ action: 'abandon', call_id: 'call-2' }), h.socket)
+  await awaiting(h, 'status'); h.answer('receiving', { next_offset: 0 })
+  await awaiting(h, 'abandon'); h.answer('aborted', { receipt: receipt(call(), intent, {
+    event_id: `.wicket-screenshot-${hash('easement\0op-1')}-${'a'.repeat(32)}.stage-1-temporary`, accepted_at: null,
+    verified: null, outcome: 'aborted'
+  }) })
+  assert.equal((await abandon).why, 'aborted'); assert.equal(h.saver.retainedBytes, 0)
+  assert.equal(h.logs.at(-1).what, 'abandon')
+})
+test('retention capacity refusal is routed instead of masquerading as unknown', async () => {
+  const h = harness()
+  h.saver.operations.set('other\0one', { reservation: LIMITS.pngBytes })
+  h.saver.operations.set('other\0two', { reservation: LIMITS.pngBytes })
+  const done = h.saver.run(call(), h.socket)
+  await awaiting(h, 'status'); h.answer('unknown')
+  const reject = await awaiting(h, 'reject'); assert.equal(reject.reason, 'retention_capacity')
+  h.answer('rejected', { reason: 'Shotgun screenshot retention capacity reached' })
+  const result = await done
+  assert.equal(result.why, 'rejected'); assert.match(result.reason, /retention capacity/)
+  assert.equal(h.captures(), 0)
+})
 test('wrong channel, call, operation, attempt, credit or receipt cannot complete a save', async () => {
   const h = harness(); const done = h.saver.run(call(), h.socket)
   const query = await awaiting(h, 'status')
@@ -204,6 +240,8 @@ test('late replies and errors never echo screenshot bytes', async () => {
   const h = harness({ capture: async () => { throw Error('RAW_SCREENSHOT_SENTINEL') } })
   const done = h.saver.run(call(), h.socket)
   await awaiting(h, 'status'); h.answer('unknown')
+  const reject = await awaiting(h, 'reject'); assert.equal(reject.reason, 'capture_failed')
+  h.answer('rejected', { reason: 'Shotgun exact PNG capture or validation failed' })
   const result = await done
   assert.equal(result.why, 'rejected')
   assert.equal(JSON.stringify([result, h.logs]).includes('RAW_SCREENSHOT_SENTINEL'), false)
@@ -264,6 +302,11 @@ test('capture reservations bound concurrent memory even while CDP is pending', a
   for (let n = 0; n < 3; n++) {
     runs.push(h.saver.run(call({ call_id: `call-${n}`, operation_id: `op-${n}` }), h.socket))
     await awaiting(h, 'status'); h.answer('unknown'); await tick()
+    if (n === 2) {
+      await awaiting(h, 'reject')
+      assert.equal(h.sent.at(-1).reason, 'retention_capacity')
+      h.answer('rejected', { reason: 'Shotgun screenshot retention capacity reached' })
+    }
   }
   assert.equal(pending.length, 2); assert.equal(h.saver.retainedBytes, LIMITS.totalBytes)
   assert.equal((await runs[2]).why, 'rejected')

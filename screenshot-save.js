@@ -3,7 +3,7 @@
 export const LIMITS = Object.freeze({
   pngBytes: 32 * 1024 * 1024, chunkBytes: 64 * 1024,
   totalBytes: 64 * 1024 * 1024, operations: 4,
-  dimension: 32768, pixels: 32 * 1024 * 1024, packetBytes: 96 * 1024
+  dimension: 32768, pixels: 64 * 1024 * 1024, packetBytes: 96 * 1024
 })
 
 const encoder = new TextEncoder()
@@ -167,7 +167,7 @@ export async function validateReceipt (receipt, why, args, local) {
 
 function validateCall (args) {
   if (!id(args.call_id) || !id(args.slug) || !id(args.operation_id)) fail('screenshot_save requires valid call, slug and caller-known operation_id')
-  if (!['capture', 'retry', 'status'].includes(args.action)) fail('screenshot_save requires action capture, retry or status')
+  if (!['capture', 'retry', 'status', 'abandon'].includes(args.action)) fail('screenshot_save requires action capture, retry, status or abandon')
   if (args.where !== undefined && args.where !== 'localhost') fail('screenshot_save supports only localhost')
   if (args.destination !== undefined && !path(args.destination)) fail('destination must be absolute without dot components')
   if (args.mode !== undefined && !['viewport', 'full_page'].includes(args.mode)) fail('invalid screenshot mode')
@@ -175,7 +175,7 @@ function validateCall (args) {
   if (args.action === 'capture' && (args.destination === undefined || args.mode === undefined)) fail('capture requires destination and mode')
 }
 const terminal = why => ['stored', 'published', 'failed', 'aborted'].includes(why)
-const disposition = why => terminal(why) || ['unknown', 'receiving', 'rejected', 'unresolved'].includes(why)
+const disposition = why => terminal(why) || ['unknown', 'receiving', 'rejected', 'unresolved', 'abandoned'].includes(why)
 
 export class ScreenshotSaver {
   constructor ({ send, capture, observe = () => {}, timeout = 25000 }) {
@@ -258,7 +258,7 @@ export class ScreenshotSaver {
       }
     }
     else {
-      const allowed = why === 'status' ? ['unknown', 'receiving', 'rejected', 'unresolved'] : why === 'begin' ? ['ready', 'rejected', 'unresolved'] : why === 'chunk' ? ['ack', 'rejected', 'unresolved'] : ['rejected', 'unresolved']
+      const allowed = why === 'status' ? ['unknown', 'receiving', 'rejected', 'unresolved'] : why === 'begin' ? ['ready', 'rejected', 'unresolved'] : why === 'chunk' ? ['ack', 'rejected', 'unresolved'] : why === 'abandon' ? ['abandoned', 'rejected', 'unresolved'] : ['rejected', 'unresolved']
       if (!allowed.includes(result.why) || result.receipt !== undefined ||
         (result.reason !== undefined && typeof result.reason !== 'string')) fail('screenshot reply violates phase')
       if (['ready', 'ack', 'receiving'].includes(result.why)) {
@@ -285,6 +285,15 @@ export class ScreenshotSaver {
     try {
       let result = await this.exchange(ctx, 'status', { where: 'localhost' })
       if (terminal(result.why)) { this.release(ctx.key); return result }
+      if (args.action === 'abandon') {
+        try {
+          if (['unknown', 'receiving'].includes(result.why)) result = await this.exchange(ctx, 'abandon')
+          return result
+        } finally {
+          this.release(ctx.key)
+          this.note(ctx, 'abandon', 'explicitly discarded retained PNG bytes')
+        }
+      }
       if (args.action === 'status' || !['unknown', 'receiving'].includes(result.why)) return result
       let op = this.operations.get(ctx.key)
       if (args.action === 'retry' && !op?.bytes) return result
@@ -293,7 +302,9 @@ export class ScreenshotSaver {
       if (args.action === 'capture') {
         if (result.why !== 'unknown') return result
         if (op) fail('operation already captured in this worker; use retry with the original intent')
-        if (this.operations.size >= LIMITS.operations || this.retainedBytes + LIMITS.pngBytes > LIMITS.totalBytes) fail('screenshot memory capacity reached')
+        if (this.operations.size >= LIMITS.operations || this.retainedBytes + LIMITS.pngBytes > LIMITS.totalBytes) {
+          return await this.exchange(ctx, 'reject', { reason: 'retention_capacity' })
+        }
         op = { reservation: LIMITS.pngBytes }; this.operations.set(ctx.key, op)
         this.note(ctx, 'capture', 'requested exact PNG capture')
         // Chrome has no capture-cancel primitive. A disconnected call can end
@@ -318,7 +329,7 @@ export class ScreenshotSaver {
         const captureTimer = setTimeout(() => this.stop(ctx, 'capture deadline elapsed'), 20000)
         const complete = await Promise.race([captureTask, ctx.interrupted])
         clearTimeout(captureTimer)
-        if (complete === false) fail('exact PNG capture or validation failed')
+        if (complete === false) return await this.exchange(ctx, 'reject', { reason: 'capture_failed' })
       }
       if (ctx.stopped) return ctx.late ?? this.packet(ctx, 'unresolved', { reason: 'capture retained in memory; query status by operation_id' })
       // Easement binds destination before dispatch. Retry cannot supply it late.

@@ -201,7 +201,7 @@ async function navigateTab (tabId, url) {
 let ws = null
 
 const TOOLS = [
-  { f: 'screenshot_save', description: 'Save an exact PNG through Wicket. Required: action (capture|retry|status), operation_id (caller-known string; use a fresh ID for a deliberate new capture). Capture also requires destination (absolute file path with an existing parent) and mode (viewport|full_page). tabId (int, optional), where (localhost only, optional). Always checks status first. Retry uses only bytes retained in this worker and requires the original destination to retransmit; after worker loss it only reports status. Returns a Wicket outcome as text, without image content.' },
+  { f: 'screenshot_save', description: 'Save an exact PNG through Wicket. Required: action (capture|retry|status|abandon), operation_id (caller-known string; use a fresh ID for a deliberate new capture). Capture also requires destination (absolute file path with an existing parent) and mode (viewport|full_page). tabId (int, optional), where (localhost only, optional). Always checks status first. Retry uses only bytes retained in this worker and requires the original destination to retransmit; abandon explicitly releases retained bytes and cancels a live receive when one exists. After worker loss retry only reports status. Returns a Wicket outcome as text, without image content.' },
   { f: 'screenshot', description: 'Capture a screenshot of a browser tab. Args: tabId (int, optional).' },
   { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
   { f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
@@ -488,7 +488,7 @@ function handleToolRun (msg, socket) {
 
 async function handleScreenshotSave (msg, socket) {
   const result = await screenshotSaver.run(msg, socket)
-  const code = result.why === 'stored' ? 0 : 1
+  const code = result.why === 'stored' || (msg.action === 'abandon' && ['abandoned', 'aborted'].includes(result.why)) ? 0 : 1
   // The outer response carries the exact relayed outcome. It never asserts a
   // separate artifact success, and an old call never replies on a new socket.
   if (socket.readyState === WebSocket.OPEN) {

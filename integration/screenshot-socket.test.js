@@ -95,6 +95,7 @@ test('actual producer/router/writer store identical PNG bytes, recover status an
     const status = await call({ action: 'status', operation_id: 'fixture-save' })
     assert.deepEqual(status.receipt, stored.receipt)
     assert.equal((await call({ action: 'status', operation_id: 'never-used' })).why, 'unknown')
+    assert.equal((await call({ action: 'abandon', operation_id: 'never-used-abandon' })).why, 'abandoned')
     assert.equal((await call({ action: 'retry', operation_id: 'lost-worker-bytes' })).why, 'unknown')
     const beforeRestart = captured
     socket.close(); await once(socket, 'close'); socket = await producer()
