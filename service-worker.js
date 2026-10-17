@@ -65,12 +65,13 @@ function utf8ToBase64 (str) {
 
 const tabGroups = new Map()
 const tabGroupTasks = new Map()
+let tabGroupStartup = Promise.resolve()
 
 function ownsTabGroup (slug, group) {
   return group?.title === slug && group?.color === GROUP_COLOR
 }
 
-async function withTabGroup (slug, work) {
+async function queueTabGroup (slug, work) {
   const previous = tabGroupTasks.get(slug) || Promise.resolve()
   const current = previous.catch(() => {}).then(work)
   tabGroupTasks.set(slug, current)
@@ -79,12 +80,17 @@ async function withTabGroup (slug, work) {
   }
 }
 
-// Internal helpers run under withTabGroup, including creation and persistence.
-async function loadTabGroupForSlug (slug) {
+function withTabGroup (slug, work) {
+  return tabGroupStartup.then(() => queueTabGroup(slug, work))
+}
+
+// Internal helpers run under a per-slug queue, including startup recovery,
+// creation and persistence.
+async function loadTabGroupForSlug (slug, reconcile = false) {
   if (!slug) return null
   const key = STORAGE_KEY_PREFIX + slug
-  const id = tabGroups.get(slug) ?? (await chrome.storage.local.get(key))[key]
-  if (id != null) {
+  const id = reconcile ? null : tabGroups.get(slug) ?? (await chrome.storage.local.get(key))[key]
+  if (!reconcile && id != null) {
     let group
     if (Number.isSafeInteger(id) && id >= 0) {
       try { group = await chrome.tabGroups.get(id) } catch { /* Fall back to a current title lookup. */ }
@@ -105,7 +111,13 @@ async function loadTabGroupForSlug (slug) {
   // Chrome's title query is pattern-based; enforce exact title and color here.
   const groups = (await chrome.tabGroups.query({}))
     .filter(group => ownsTabGroup(slug, group)).sort((a, b) => a.id - b.id)
-  if (groups.length === 0) return null
+  if (groups.length === 0) {
+    if (reconcile) {
+      tabGroups.delete(slug)
+      await chrome.storage.local.remove(key)
+    }
+    return null
+  }
   const canonical = groups[0]
   let groupId = canonical.id
   // Chrome mutations are not transactional. Propagate errors instead of
@@ -181,6 +193,24 @@ function createTabInGroup (slug, url) {
     }
   })
 }
+
+async function recoverStoredTabGroups() {
+  let stored
+  try {
+    stored = await chrome.storage.local.get(null)
+  } catch {
+    trace('tabs', 'fail_recover', { why: 'stored tab group keys could not be enumerated' })
+    return
+  }
+  const slugs = [...new Set(Object.keys(stored)
+    .filter(key => key.startsWith(STORAGE_KEY_PREFIX))
+    .map(key => key.slice(STORAGE_KEY_PREFIX.length)).filter(Boolean))].sort()
+  await Promise.all(slugs.map(slug => queueTabGroup(slug, () => loadTabGroupForSlug(slug, true)).catch(() => {
+    trace('tabs', 'fail_recover', { why: 'startup tab group reconciliation failed', slug })
+  })))
+}
+
+tabGroupStartup = recoverStoredTabGroups()
 
 async function navigateTab (tabId, url) {
   try {

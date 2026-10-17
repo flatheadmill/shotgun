@@ -10,13 +10,13 @@ let imports = 0
 // Actual worker dispatch, with a stateful Chrome boundary. Moving tabs across
 // windows ungroups them and deletes their empty source group immediately; using
 // that old group ID afterward fails. This is not a loaded-browser test.
-async function worker ({ groups = [], tabs = [], storage = {}, before = async () => {} } = {}) {
+async function worker ({ groups = [], tabs = [], storage = {}, before = async () => {}, startup = true } = {}) {
   const previous = Object.fromEntries(['chrome', 'WebSocket', 'setInterval', 'clearInterval'].map(k => [k, globalThis[k]]))
   const originalLog = console.log; console.log = () => {}
   const state = {
     groups: new Map(groups.map(g => [g.id, { color: 'yellow', collapsed: false, ...g }])),
     tabs: new Map(tabs.map((t, index) => [t.id, { index, url: `https://example.test/${t.id}`, title: `Tab ${t.id}`, ...t }])),
-    storage: { ...storage }, calls: []
+    storage: { ...storage }, calls: [], startup
   }
   let nextTab = 1000; let nextGroup = 100; let sequence = 0; let socket
   const event = { addListener () {} }
@@ -47,7 +47,7 @@ async function worker ({ groups = [], tabs = [], storage = {}, before = async ()
   }
   const browser = {
     storage: { local: {
-      get: async k => { await record('storage.get', k); return { [k]: state.storage[k] } },
+      get: async k => { await record('storage.get', k); return k === null ? (state.startup ? { ...state.storage } : {}) : { [k]: state.storage[k] } },
       set: async values => { await record('storage.set', values); Object.assign(state.storage, values) },
       remove: async k => { await record('storage.remove', k); delete state.storage[k] }
     } },
@@ -106,7 +106,7 @@ async function worker ({ groups = [], tabs = [], storage = {}, before = async ()
       else globalThis[name] = value
     }
   }
-  try { await import(`../service-worker.js?groups-test=${++imports}`); socket.listeners.open() } catch (error) { await cleanup(); throw error }
+  try { await import(`../service-worker.js?groups-test=${++imports}`); socket.listeners.open(); await tick() } catch (error) { await cleanup(); throw error }
   return { state, cleanup, invoke: async (f, slug, args = {}) => {
     const call_id = `group-call-${++sequence}`
     socket.receive({ what: 'tool', why: 'run', f, slug, call_id, ...args })
@@ -118,6 +118,17 @@ async function worker ({ groups = [], tabs = [], storage = {}, before = async ()
     return response.exit_code ? { error: response.output } : JSON.parse(response.output)
   } }
 }
+
+test('worker startup reconciles duplicate stored groups before any tool call', async () => {
+  const f = await worker({ storage: { [key('seat')]: 9 }, groups: [9, 3, 6].map(id => ({ id, windowId: 1, title: 'seat' })),
+    tabs: [9, 3, 6].map(id => ({ id: id + 10, windowId: 1, groupId: id })) })
+  try {
+    assert.deepEqual([...f.state.groups.keys()], [3])
+    assert.equal(f.state.storage[key('seat')], 3)
+    assert.deepEqual([...f.state.tabs.values()].map(tab => tab.groupId), [3, 3, 3])
+    assert.equal(f.state.calls.filter(call => call.method === 'groups.query').length, 1)
+  } finally { await f.cleanup() }
+})
 
 test('stale stored ID adopts the exact slug title in yellow and persists its current ID', async () => {
   const f = await worker({ storage: { [key('seat*')]: 88 }, groups: [
@@ -262,7 +273,7 @@ test('regroup failure after a cross-window move preserves tabs and does not clai
 test('persistence failure leaves recovered tabs intact and a later lookup retries persistence', async () => {
   let fail = true
   const f = await worker({ groups: [{ id: 2, windowId: 1, title: 'seat' }], tabs: [{ id: 1, windowId: 1, groupId: 2 }],
-    before: method => { if (method === 'storage.set' && fail) { fail = false; throw new Error('storage unavailable') } } })
+    before: method => { if (method === 'storage.set' && fail) { fail = false; throw new Error('storage unavailable') } }, startup: false })
   try {
     assert.match((await f.invoke('tabs_context', 'seat')).error, /storage unavailable/)
     assert.equal(f.state.storage[key('seat')], undefined)
