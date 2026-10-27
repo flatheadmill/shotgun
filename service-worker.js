@@ -236,7 +236,7 @@ const TOOLS = [
   { f: 'javascript', description: 'Execute JavaScript in a browser tab. Args: code (string), tabId (int, optional).' },
   { f: 'tabs_context', description: 'List tabs in the browser tab group for this slug.' },
   { f: 'tabs_create', description: 'Open a new tab. Args: url (string, optional).' },
-  { f: 'tabs_close', description: 'Close a browser tab. Args: tabId (positive safe integer, required).' },
+  { f: 'tabs_close', description: 'Close one or more browser tabs. Args: exactly one of tabId (positive safe integer) or tabIds (non-empty array of distinct positive safe integers).' },
   { f: 'navigate', description: 'Navigate a tab to a URL. Args: tabId (int), url (string).' },
   { f: 'read_page', description: 'Read page text through the isolated world content script. Invisible to the page. Args: selector (string, optional CSS selector to scope the read), maxChars (int, optional, default 50000), tabId (int, optional), frameId (int, optional, default 0 for top frame).' },
   { f: 'firehose', description: 'Temporary passive Network tap with one in-memory pile. action=start requires an explicit tabId (positive int), with optional url (absolute URL literal without query or fragment) selecting response bodies; all request metadata is observed. Start after stop replaces the pile. action=read inspects from (int, default 0) and limit (1-100, default 50), or body (one body-outcome pile index). Reading never starts capture or fetches a body. action=stop freezes the pile and disables Network reporting without detaching the debugger. One body command, no queue; busy, unavailable, clipping and full are explicit. Fixed limits are reported; worker loss loses the pile. No persistence or application parsing.' },
@@ -497,7 +497,7 @@ function handleToolRun (msg, socket) {
       handleTabsCreate(callId, currentSlug, msg.url)
       break
     case 'tabs_close':
-      handleTabsClose(callId, msg.tabId)
+      handleTabsClose(callId, msg.tabId, msg.tabIds)
       break
     case 'navigate':
       handleNavigate(callId, msg.tabId, msg.url)
@@ -584,14 +584,24 @@ async function handleTabsCreate (callId, slug, url) {
   }
 }
 
-async function handleTabsClose (callId, tabId) {
-  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
-    sendToolReject(callId, 'tabId is required and must be a positive safe integer')
+async function handleTabsClose (callId, tabId, tabIds) {
+  const hasTabId = tabId !== undefined
+  const hasTabIds = tabIds !== undefined
+  if (hasTabId === hasTabIds) {
+    sendToolReject(callId, 'exactly one of tabId or tabIds is required')
     return
   }
+  const ids = hasTabId ? [tabId] : tabIds
+  if (!Array.isArray(ids) || ids.length === 0 ||
+      ids.some(id => !Number.isSafeInteger(id) || id <= 0) ||
+      new Set(ids).size !== ids.length) {
+    sendToolReject(callId, 'tabId must be a positive safe integer; tabIds must be a non-empty array of distinct positive safe integers')
+    return
+  }
+  const target = hasTabId ? tabId : ids
   try {
-    await chrome.tabs.remove(tabId)
-    sendToolResponse(callId, `Closed tab ${tabId}`, 0)
+    await chrome.tabs.remove(target)
+    sendToolResponse(callId, ids.length === 1 ? `Closed tab ${ids[0]}` : `Closed tabs ${ids.join(', ')}`, 0)
   } catch (e) {
     sendToolFailure(callId, e.message || 'tabs_close failed')
   }

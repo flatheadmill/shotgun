@@ -31,9 +31,9 @@ test('actual worker closes explicit tabs, routes quiet save status, and preserve
     alarms: { create () {}, onAlarm: event },
     tabs: {
       onRemoved: event, onUpdated: event, query: async () => [{ id: 7 }], get: async () => ({ url: 'https://example.test/', title: 'Fixture' }),
-      remove: async tabId => {
-        removals.push(tabId)
-        if (tabId === 9) throw new Error('No tab with id: 9')
+      remove: async tabIds => {
+        removals.push(tabIds)
+        if ((Array.isArray(tabIds) ? tabIds : [tabIds]).includes(9)) throw new Error('No tab with id: 9')
       }
     },
     debugger: { onDetach: event, onEvent: event, attach: async () => { if (holdAttach) await new Promise(resolve => pendingAttaches.push(resolve)) }, sendCommand: async (target, command, params) => {
@@ -58,18 +58,30 @@ test('actual worker closes explicit tabs, routes quiet save status, and preserve
     assert.deepEqual(frames.find(f => f.what === 'tool' && f.call_id === 'close-success'), {
       what: 'tool', why: 'response', call_id: 'close-success', output: 'Closed tab 12', exit_code: 0
     })
-    for (const [n, tabId] of [undefined, null, 0, -1, 1.5, '7', true, [], [7], {}, Number.MAX_SAFE_INTEGER + 1].entries()) {
+    socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id: 'close-many', slug: 'easement', tabIds: [13, 14, 15] })
+    await tick()
+    assert.deepEqual(removals, [12, [13, 14, 15]])
+    assert.deepEqual(frames.find(f => f.what === 'tool' && f.call_id === 'close-many'), {
+      what: 'tool', why: 'response', call_id: 'close-many', output: 'Closed tabs 13, 14, 15', exit_code: 0
+    })
+    for (const [n, args] of [
+      {}, { tabId: null }, { tabId: 0 }, { tabId: -1 }, { tabId: 1.5 }, { tabId: '7' },
+      { tabId: true }, { tabId: [] }, { tabId: [7] }, { tabId: {} },
+      { tabId: Number.MAX_SAFE_INTEGER + 1 }, { tabIds: null }, { tabIds: [] },
+      { tabIds: [7, 0] }, { tabIds: [7, '8'] }, { tabIds: [7, 7] },
+      { tabId: 7, tabIds: [8] }
+    ].entries()) {
       const call_id = `close-invalid-${n}`
-      socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id, slug: 'easement', tabId })
+      socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id, slug: 'easement', ...args })
       await tick()
       const response = frames.find(f => f.what === 'tool' && f.call_id === call_id)
       assert.equal(response.exit_code, 1)
-      assert.match(response.output, /tabId.*positive safe integer/)
-      assert.deepEqual(removals, [12], 'invalid IDs must not call chrome.tabs.remove')
+      assert.match(response.output, /tabId|tabIds/)
+      assert.deepEqual(removals, [12, [13, 14, 15]], 'invalid IDs must not call chrome.tabs.remove')
     }
-    socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id: 'close-failure', slug: 'easement', tabId: 9 })
+    socket.receive({ what: 'tool', why: 'run', f: 'tabs_close', call_id: 'close-failure', slug: 'easement', tabIds: [9, 10] })
     await tick()
-    assert.deepEqual(removals, [12, 9])
+    assert.deepEqual(removals, [12, [13, 14, 15], [9, 10]])
     const closeFailure = frames.find(f => f.what === 'tool' && f.call_id === 'close-failure')
     assert.equal(closeFailure.exit_code, 1)
     assert.equal(closeFailure.output, 'No tab with id: 9')
